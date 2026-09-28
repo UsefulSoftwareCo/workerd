@@ -165,8 +165,19 @@ jobs:
           cd /tmp/release
           base="${tag%%-executor.*}"
           notes="Executor build of workerd ${base}, built from ${SHA} on ${GITHUB_REF_NAME}. See EXECUTOR.md on that commit for the patches applied on top of upstream ${base}."
+          # Consumers pin these files by SHA-256, so a published release is never changed. A re-run
+          # only fills in files a failed attempt left out, and fails if the build differs.
           if gh release view "$tag" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release upload "$tag" -R "$GITHUB_REPOSITORY" workerd-linux-64.gz workerd-linux-arm64.gz SHA256SUMS --clobber
+            if gh release download "$tag" -R "$GITHUB_REPOSITORY" -p SHA256SUMS -O /tmp/published.sums 2>/dev/null; then
+              if cmp -s /tmp/published.sums SHA256SUMS; then
+                echo "$tag is already published with identical files"
+                exit 0
+              fi
+              echo "::error::$tag is already published with different files; refusing to replace them"
+              diff /tmp/published.sums SHA256SUMS || true
+              exit 1
+            fi
+            gh release upload "$tag" -R "$GITHUB_REPOSITORY" workerd-linux-64.gz workerd-linux-arm64.gz SHA256SUMS
           else
             gh release create "$tag" -R "$GITHUB_REPOSITORY" workerd-linux-64.gz workerd-linux-arm64.gz SHA256SUMS \
               --target "$SHA" --title "$tag" --notes "$notes"
