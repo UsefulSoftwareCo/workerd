@@ -11,6 +11,8 @@ on:
   push:
     branches:
       - 'executor/**'
+    paths-ignore:
+      - 'EXECUTOR.md'
   workflow_dispatch:
     inputs:
       from_run:
@@ -151,9 +153,8 @@ jobs:
         with:
           name: release-files
           path: /tmp/release/
-      # UsefulSoftwareCo disables write permissions for workflow tokens, so GITHUB_TOKEN cannot
-      # create releases there. Until an organization admin allows it (or a release token secret
-      # is added), this step fails and the release is created from the release-files artifact.
+      # Workflow tokens in UsefulSoftwareCo default to read-only, and some runs have been refused
+      # release creation. If that happens, create the release from the release-files artifact.
       - name: Publish
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
