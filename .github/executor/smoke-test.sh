@@ -49,7 +49,7 @@ CAPNP
 
 # start NAME PORT: starts workerd in the background and waits for it to listen.
 start() {
-  "$WORKERD" serve --experimental --verbose "$DIR/$1.capnp" > "$DIR/$1.log" 2>&1 &
+  "$WORKERD" serve --experimental --verbose ${INSPECTOR:+--inspector-addr=127.0.0.1:$INSPECTOR} "$DIR/$1.capnp" > "$DIR/$1.log" 2>&1 &
   for _ in $(seq 1 100); do
     if curl -sf "http://127.0.0.1:$2/?name=probe" > /dev/null; then return 0; fi
     sleep 0.1
@@ -119,5 +119,13 @@ sleep 1.5
 expect_log loader "executor: unloaded idle Worker loader isolates"
 expect "http://127.0.0.1:18084/?name=a" 1
 expect "http://127.0.0.1:18084/?name=a" 2
+
+# The same with the inspector enabled: loading a name again after it was unloaded must work.
+write_config inspector 18085 "memory = (maintenanceIntervalMs = 100, workerLoaderIdleTtlMs = 500),"
+INSPECTOR=19229 start inspector 18085
+expect "http://127.0.0.1:18085/?name=a" 1
+sleep 1.5
+expect_log inspector "executor: unloaded idle Worker loader isolates"
+expect "http://127.0.0.1:18085/?name=a" 1
 
 echo "smoke test passed"

@@ -3043,7 +3043,15 @@ class Server::InspectorService final: public kj::HttpService, public kj::HttpSer
   }
 
   void registerIsolate(kj::StringPtr name, Worker::Isolate* isolate) {
-    isolates.insert(kj::str(name), isolate->getWeakRef());
+    // Executor fork: a Worker loader isolate that was unloaded (abortIsolate() or idle eviction)
+    // registers again under the same name when it is loaded again. Upstream used insert(), which
+    // throws "inserted row already exists in table" and fails that load whenever the inspector is
+    // enabled. The old entry's isolate is gone or going, so replace it.
+    isolates.upsert(kj::str(name), isolate->getWeakRef(),
+        [](kj::Own<const Worker::Isolate::WeakIsolateRef>& existing,
+            kj::Own<const Worker::Isolate::WeakIsolateRef>&& replacement) {
+      existing = kj::mv(replacement);
+    });
   }
 
  private:
