@@ -22,6 +22,24 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # Compiles only the files the Executor patches touch, so that errors show up in minutes instead
+  # of after the multi-hour V8 build.
+  compile-check:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          show-progress: false
+      - name: Setup Runner
+        uses: ./.github/actions/setup-runner
+        with:
+          GOOGLESOURCE_COOKIE: ''
+      - name: Compile server.c++
+        run: |
+          bazel build --config=ci --config=ci-linux-common --config=release_linux \
+            --output_groups=compilation_outputs //src/workerd/server:server
+
   build:
     strategy:
       fail-fast: false
