@@ -1,0 +1,123 @@
+# Builds the Executor fork of workerd for Linux (x64 and arm64) and publishes the binaries as a
+# GitHub release on this fork, with SHA-256 checksums.
+#
+# This fork does not have access to Cloudflare's remote Bazel cache or larger runners, so the
+# build runs on standard GitHub-hosted runners (4 vCPU) and relies on the GitHub Actions cache
+# for Bazel's disk cache. The cache is saved even when the build step times out, so a cold build
+# that does not fit in one job makes progress and a re-run picks up where it stopped.
+name: Executor workerd release
+
+on:
+  push:
+    branches:
+      - 'executor/**'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: executor-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Ubuntu 22.04 matches upstream release builds (glibc 2.35).
+          - arch: linux-64
+            image: ubuntu-22.04
+          - arch: linux-arm64
+            image: ubuntu-22.04-arm
+    name: build (${{ matrix.arch }})
+    runs-on: ${{ matrix.image }}
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          show-progress: false
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/share/swift || true
+          sudo docker image prune --all --force || true
+          df -h /
+      - name: Restore Bazel disk cache
+        uses: actions/cache/restore@v5
+        with:
+          path: ~/bazel-disk-cache
+          key: executor-bazel-${{ matrix.arch }}-${{ hashFiles('.bazelversion', '.bazelrc', 'MODULE.bazel', 'build/deps/gen/*.bzl', 'build/deps/gen/*.bazel') }}-${{ github.sha }}
+          restore-keys: |
+            executor-bazel-${{ matrix.arch }}-${{ hashFiles('.bazelversion', '.bazelrc', 'MODULE.bazel', 'build/deps/gen/*.bzl', 'build/deps/gen/*.bazel') }}-
+      - name: Setup Runner
+        uses: ./.github/actions/setup-runner
+        with:
+          GOOGLESOURCE_COOKIE: ''
+      - name: Bazel build
+        id: build
+        timeout-minutes: 320
+        run: |
+          bazel build --config=ci --config=ci-linux-common --config=release_linux --strip=always \
+            --local_resources=memory=HOST_RAM*.8 \
+            //src/workerd/server:workerd
+      - name: Smoke test
+        if: steps.build.outcome == 'success'
+        run: |
+          cp bazel-bin/src/workerd/server/workerd /tmp/workerd
+          /tmp/workerd --version
+          bash .github/executor/smoke-test.sh /tmp/workerd
+      - name: Upload binary
+        if: steps.build.outcome == 'success'
+        uses: actions/upload-artifact@v7
+        with:
+          name: workerd-${{ matrix.arch }}
+          path: /tmp/workerd
+          if-no-files-found: error
+      - name: Trim Bazel disk cache
+        if: always()
+        run: |
+          if [ -d ~/bazel-disk-cache ]; then
+            find ~/bazel-disk-cache -size +100M -type f -delete
+            du -ms ~/bazel-disk-cache
+          fi
+          bazel shutdown || true
+      - name: Save Bazel disk cache
+        if: always()
+        uses: actions/cache/save@v5
+        with:
+          path: ~/bazel-disk-cache
+          key: executor-bazel-${{ matrix.arch }}-${{ hashFiles('.bazelversion', '.bazelrc', 'MODULE.bazel', 'build/deps/gen/*.bzl', 'build/deps/gen/*.bazel') }}-${{ github.sha }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v8
+        with:
+          path: /tmp/artifacts
+      - name: Package and publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          base="v$(cat src/workerd/io/release-version.txt | tr -d '-' | sed 's/^/1./').1"
+          tag="${base}-executor.$(git rev-parse --short=10 HEAD)"
+          mkdir -p /tmp/release
+          for arch in linux-64 linux-arm64; do
+            install -m 755 /tmp/artifacts/workerd-$arch/workerd /tmp/release/workerd-$arch
+            gzip -9n -c /tmp/release/workerd-$arch > /tmp/release/workerd-$arch.gz
+          done
+          cd /tmp/release
+          sha256sum workerd-linux-64 workerd-linux-arm64 workerd-linux-64.gz workerd-linux-arm64.gz > SHA256SUMS
+          cat SHA256SUMS
+          notes="Executor build of workerd ${base} from ${GITHUB_REF_NAME} at ${GITHUB_SHA}. See the branch history for the patches applied on top of upstream ${base}."
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" workerd-linux-64.gz workerd-linux-arm64.gz SHA256SUMS --clobber
+          else
+            gh release create "$tag" workerd-linux-64.gz workerd-linux-arm64.gz SHA256SUMS \
+              --target "$GITHUB_SHA" --title "$tag" --notes "$notes"
+          fi
