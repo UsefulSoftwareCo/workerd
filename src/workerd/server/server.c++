@@ -3633,6 +3633,14 @@ class Server::WorkerService final: public Service,
     ioChannels = kj::mv(linked);
   }
 
+  // Executor fork: true while this Worker still has work in progress: a request, an IoContext
+  // that outlives its request (ctx.waitUntil()), or an actor. Each of those holds a reference to
+  // `worker`, and a request's drain task sits in `waitUntilTasks`. Unlinking now would cancel
+  // that work. Used by WorkerLoaderNamespace::evictIdle().
+  bool hasPendingWork() {
+    return worker->isShared() || !waitUntilTasks.isEmpty();
+  }
+
   void unlink() override {
     // Need to remove all waited until tasks before destroying `ioChannels`
     waitUntilTasks.clear();
@@ -5168,16 +5176,18 @@ class Server::WorkerLoaderNamespace: public kj::Refcounted, private kj::TaskSet:
     isolates.erase(name);
   }
 
-  // Executor fork: unloads named isolates that nothing has referenced for `ttl`. The map holds one
+  // Executor fork: unloads named isolates that have been unused for `ttl`. The map holds one
   // reference to each stub; callers' stubs, in-flight requests, and entrypoint and actor class
-  // channels each hold another. So an entry that is not shared is unused, and dropping it tears
-  // the isolate down the same way abortIsolate() does. Stubs that have not finished starting are
-  // left alone. Returns the number of isolates unloaded.
+  // channels each hold another. A request's reference ends with its response, though, while
+  // ctx.waitUntil() work and actors keep running in the Worker, so an entry also counts as used
+  // while its Worker has any of those (WorkerService::hasPendingWork()). Dropping an unused entry
+  // tears the isolate down the same way abortIsolate() does. Stubs that have not finished
+  // starting are left alone. Returns the number of isolates unloaded.
   uint evictIdle(kj::TimePoint now, kj::Duration ttl) {
     kj::Vector<kj::String> expired;
     for (auto& entry: isolates) {
       auto& stub = *entry.value;
-      if (stub.isShared() || !stub.isStarted()) {
+      if (stub.isShared() || !stub.isIdle()) {
         stub.idleSince = kj::none;
         continue;
       }
@@ -5277,9 +5287,13 @@ class Server::WorkerLoaderNamespace: public kj::Refcounted, private kj::TaskSet:
       unlinked = true;
     }
 
-    // Executor fork: used by WorkerLoaderNamespace::evictIdle().
-    bool isStarted() const {
-      return service != kj::none;
+    // Executor fork: used by WorkerLoaderNamespace::evictIdle(). True when the Worker has
+    // started and has no request, ctx.waitUntil() work or actor in progress.
+    bool isIdle() {
+      KJ_IF_SOME(s, service) {
+        return !s->hasPendingWork();
+      }
+      return false;
     }
     kj::Maybe<kj::TimePoint> idleSince;
 

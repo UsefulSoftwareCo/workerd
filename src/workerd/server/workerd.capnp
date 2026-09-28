@@ -166,6 +166,9 @@ struct MemoryOptions {
   # class channel) for this many milliseconds. The next load() or get() with that name starts a
   # fresh isolate. Upstream workerd documents that a loader automatically unloads Workers that are
   # not in use, but keeps every named isolate until it is aborted. 0 keeps upstream behavior.
+  #
+  # A Worker also counts as referenced while it has ctx.waitUntil() work or an actor running, so
+  # background work is never cut off; the TTL starts once that work has finished.
 }
 
 struct LoggingOptions {

@@ -21,10 +21,23 @@ export default {
       compatibilityDate: '2026-01-01',
       mainModule: 'child.js',
       modules: {
-        'child.js': 'let hits = 0; export default { fetch() { hits += 1; return new Response(String(hits)); } }',
+        // mode=bg schedules ctx.waitUntil() work that finishes 3 s after the response;
+        // mode=state reports how many of those finished in this isolate.
+        'child.js': `let hits = 0; let bg = 0;
+export default { fetch(request, env, ctx) {
+  hits += 1;
+  const mode = new URL(request.url).searchParams.get('mode');
+  if (mode === 'bg') {
+    ctx.waitUntil(new Promise((resolve) => setTimeout(resolve, 3000)).then(() => {
+      bg += 1;
+      console.log('child waitUntil done');
+    }));
+  }
+  return new Response(mode === 'state' ? hits + ' bg=' + bg : String(hits));
+} }`,
       },
     }));
-    return stub.getEntrypoint().fetch('http://child/');
+    return stub.getEntrypoint().fetch('http://child/' + url.search);
   },
 };
 JS
@@ -76,6 +89,13 @@ expect "http://127.0.0.1:18081/?name=a" 1
 expect "http://127.0.0.1:18081/?name=a" 2
 sleep 3
 expect "http://127.0.0.1:18081/?name=a" 3
+# Without a memory config none of the Executor maintenance runs.
+if grep -q "executor:" "$DIR/default.log"; then
+  cat "$DIR/default.log"
+  echo "FAIL: default config logged Executor memory maintenance" >&2
+  exit 1
+fi
+echo "ok: default config ran no Executor memory maintenance"
 
 # expect_log NAME PATTERN: waits up to 10s for PATTERN in the workerd log.
 expect_log() {
@@ -119,6 +139,19 @@ sleep 1.5
 expect_log loader "executor: unloaded idle Worker loader isolates"
 expect "http://127.0.0.1:18084/?name=a" 1
 expect "http://127.0.0.1:18084/?name=a" 2
+
+# Pending ctx.waitUntil() work keeps a named Worker loaded past the TTL. It runs to completion in
+# the same isolate, and the entry is unloaded only once it finished and the TTL passed again.
+write_config waituntil 18086 "memory = (maintenanceIntervalMs = 100, workerLoaderIdleTtlMs = 500),"
+start waituntil 18086
+expect "http://127.0.0.1:18086/?name=a" 1
+expect "http://127.0.0.1:18086/?name=a&mode=bg" 2
+sleep 4
+expect_log waituntil "child waitUntil done"
+expect "http://127.0.0.1:18086/?name=a&mode=state" "3 bg=1"
+sleep 1.5
+expect_log waituntil "executor: unloaded idle Worker loader isolates"
+expect "http://127.0.0.1:18086/?name=a" 1
 
 # The same with the inspector enabled: loading a name again after it was unloaded must work.
 write_config inspector 18085 "memory = (maintenanceIntervalMs = 100, workerLoaderIdleTtlMs = 500),"
