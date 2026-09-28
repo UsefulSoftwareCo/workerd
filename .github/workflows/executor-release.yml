@@ -22,24 +22,6 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  # Compiles only the files the Executor patches touch, so that errors show up in minutes instead
-  # of after the multi-hour V8 build.
-  compile-check:
-    runs-on: ubuntu-22.04
-    timeout-minutes: 120
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          show-progress: false
-      - name: Setup Runner
-        uses: ./.github/actions/setup-runner
-        with:
-          GOOGLESOURCE_COOKIE: ''
-      - name: Compile server.c++
-        run: |
-          bazel build --config=ci --config=ci-linux-common --config=release_linux \
-            --output_groups=compilation_outputs //src/workerd/server:server
-
   build:
     strategy:
       fail-fast: false
@@ -78,6 +60,9 @@ jobs:
         id: build
         timeout-minutes: 320
         run: |
+          # The disk cleanup removes the Android SDK the x64 image points ANDROID_HOME at;
+          # rules_android fails to fetch when that variable names a missing SDK.
+          env -u ANDROID_HOME -u ANDROID_SDK_ROOT -u ANDROID_NDK_HOME -u ANDROID_NDK_ROOT \
           bazel build --config=ci --config=ci-linux-common --config=release_linux --strip=always \
             --local_resources=memory=HOST_RAM*.8 \
             //src/workerd/server:workerd
