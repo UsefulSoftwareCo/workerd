@@ -145,6 +145,20 @@ struct MemoryOptions {
 
   pressureCooldownMs @5 :UInt32 = 30000;
   # Minimum time between two memory pressure collections triggered by `pressureThresholdMb`.
+
+  tcmallocBackgroundReleaseBytesPerSecond @6 :UInt64 = 0;
+  # When non-zero, start a thread that runs TCMalloc's background actions and set TCMalloc's
+  # background release rate to this many bytes per second, so that free memory cached in
+  # TCMalloc's page heap is returned to the OS over time. Upstream workerd never runs these
+  # background actions, so TCMalloc only returns memory when an allocation would otherwise exceed
+  # a limit, and the process footprint only grows. Only has an effect in Linux builds that use
+  # TCMalloc (the default); ignored with a warning elsewhere. 0 keeps upstream behavior.
+
+  releaseMemoryAfterGc @7 :Bool = false;
+  # When true, after the maintenance loop has collected garbage (idle-isolate or memory pressure
+  # collections), ask TCMalloc to return all free memory in its page heap to the OS
+  # (MallocExtension::ReleaseMemoryToSystem). Runs at most once per maintenance interval. Only
+  # has an effect in Linux builds that use TCMalloc.
 }
 
 struct LoggingOptions {

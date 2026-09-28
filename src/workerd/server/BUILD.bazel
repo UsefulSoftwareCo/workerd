@@ -225,6 +225,11 @@ wd_cc_library(
     hdrs = [
         "server.h",
     ],
+    # Executor fork: server.c++ configures TCMalloc through its extension API when it is in use.
+    local_defines = select({
+        ":really_use_tcmalloc": ["WD_EXECUTOR_TCMALLOC"],
+        "//conditions:default": [],
+    }),
     deps = [
         ":actor-id-impl",
         ":alarm-scheduler",
@@ -248,7 +253,10 @@ wd_cc_library(
         "//src/workerd/util:websocket-error-handler",
         "@capnp-cpp//src/kj/compat:kj-gzip",
         "@capnp-cpp//src/kj/compat:kj-tls",
-    ],
+    ] + select({
+        ":really_use_tcmalloc": ["@tcmalloc//tcmalloc:malloc_extension"],
+        "//conditions:default": [],
+    }),
 )
 
 wd_capnp_library(src = "docker-api.capnp")

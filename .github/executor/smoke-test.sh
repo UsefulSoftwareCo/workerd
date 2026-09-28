@@ -96,13 +96,16 @@ expect "http://127.0.0.1:18082/?name=a" 1
 expect_log idle "executor: collected idle isolate.*moderate"
 expect "http://127.0.0.1:18082/?name=a" 2
 
-# Idle-isolate GC (full) and the memory pressure path. A 1 MiB threshold is always exceeded.
-write_config full 18083 "memory = (maintenanceIntervalMs = 100, idleIsolateGcDelayMs = 500, idleIsolateGcMode = full, pressureThresholdMb = 1, pressureCooldownMs = 500),"
+# Idle-isolate GC (full), the memory pressure path, and TCMalloc release. A 1 MiB threshold is
+# always exceeded. TCMalloc is only used in Linux builds.
+write_config full 18083 "memory = (maintenanceIntervalMs = 100, idleIsolateGcDelayMs = 500, idleIsolateGcMode = full, pressureThresholdMb = 1, pressureCooldownMs = 500, tcmallocBackgroundReleaseBytesPerSecond = 10485760, releaseMemoryAfterGc = true),"
 start full 18083
 expect "http://127.0.0.1:18083/?name=a" 1
 expect_log full "executor: collected idle isolate.*full"
 if [ "$(uname -s)" = "Linux" ]; then
   expect_log full "executor: memory usage above threshold"
+  expect_log full "executor: TCMalloc background release enabled"
+  expect_log full "executor: released free malloc memory to the OS"
 fi
 expect "http://127.0.0.1:18083/?name=a" 2
 
