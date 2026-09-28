@@ -159,6 +159,13 @@ struct MemoryOptions {
   # collections), ask TCMalloc to return all free memory in its page heap to the OS
   # (MallocExtension::ReleaseMemoryToSystem). Runs at most once per maintenance interval. Only
   # has an effect in Linux builds that use TCMalloc.
+
+  workerLoaderIdleTtlMs @8 :UInt32 = 0;
+  # When non-zero, a named Worker loaded through a Worker loader binding is unloaded once nothing
+  # has referenced it (no stub held by a caller, no request in flight, no entrypoint or actor
+  # class channel) for this many milliseconds. The next load() or get() with that name starts a
+  # fresh isolate. Upstream workerd documents that a loader automatically unloads Workers that are
+  # not in use, but keeps every named isolate until it is aborted. 0 keeps upstream behavior.
 }
 
 struct LoggingOptions {
@@ -515,6 +522,9 @@ struct Worker {
         # A Worker loader is not just a function that loads a Worker, but also serves as a
         # cache of Workers, automatically unloading Workers that are not in use. To that end, each
         # Worker must have a name, and if a Worker with that name already exists, it'll be reused.
+        #
+        # (Executor fork: workerd only unloads such Workers when `Config.memory` sets
+        # `workerLoaderIdleTtlMs`.)
 
         id @27 :Text;
         # Optional: The identifier associated with this Worker loader. Multiple Workers can bind to

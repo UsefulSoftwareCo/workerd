@@ -109,4 +109,15 @@ if [ "$(uname -s)" = "Linux" ]; then
 fi
 expect "http://127.0.0.1:18083/?name=a" 2
 
+# Worker loader idle eviction: once nothing references a named Worker for the TTL, the next
+# get() starts a fresh isolate, so the child's counter restarts.
+write_config loader 18084 "memory = (maintenanceIntervalMs = 100, workerLoaderIdleTtlMs = 500),"
+start loader 18084
+expect "http://127.0.0.1:18084/?name=a" 1
+expect "http://127.0.0.1:18084/?name=a" 2
+sleep 1.5
+expect_log loader "executor: unloaded idle Worker loader isolates"
+expect "http://127.0.0.1:18084/?name=a" 1
+expect "http://127.0.0.1:18084/?name=a" 2
+
 echo "smoke test passed"

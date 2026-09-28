@@ -5160,6 +5160,31 @@ class Server::WorkerLoaderNamespace: public kj::Refcounted, private kj::TaskSet:
     isolates.erase(name);
   }
 
+  // Executor fork: unloads named isolates that nothing has referenced for `ttl`. The map holds one
+  // reference to each stub; callers' stubs, in-flight requests, and entrypoint and actor class
+  // channels each hold another. So an entry that is not shared is unused, and dropping it tears
+  // the isolate down the same way abortIsolate() does. Stubs that have not finished starting are
+  // left alone. Returns the number of isolates unloaded.
+  uint evictIdle(kj::TimePoint now, kj::Duration ttl) {
+    kj::Vector<kj::String> expired;
+    for (auto& entry: isolates) {
+      auto& stub = *entry.value;
+      if (stub.isShared() || !stub.isStarted()) {
+        stub.idleSince = kj::none;
+        continue;
+      }
+      KJ_IF_SOME(since, stub.idleSince) {
+        if (now - since >= ttl) expired.add(kj::str(entry.key));
+      } else {
+        stub.idleSince = now;
+      }
+    }
+    for (auto& name: expired) {
+      isolates.erase(name);
+    }
+    return expired.size();
+  }
+
  private:
   Server& server;
   kj::String namespaceName;
@@ -5243,6 +5268,12 @@ class Server::WorkerLoaderNamespace: public kj::Refcounted, private kj::TaskSet:
       }
       unlinked = true;
     }
+
+    // Executor fork: used by WorkerLoaderNamespace::evictIdle().
+    bool isStarted() const {
+      return service != kj::none;
+    }
+    kj::Maybe<kj::TimePoint> idleSince;
 
     kj::Own<IoChannelFactory::SubrequestChannel> getEntrypointResolved(
         kj::Maybe<kj::String> name, Frankenvalue props, kj::Maybe<ResourceLimits> limits) override {
@@ -5582,11 +5613,13 @@ class Server::MemoryMaintenance final: private kj::TaskSet::ErrorHandler {
         pressureThresholdBytes(conf.getPressureThresholdMb() * 1024 * 1024),
         pressureCooldown(conf.getPressureCooldownMs() * kj::MILLISECONDS),
         releaseMemoryAfterGc(conf.getReleaseMemoryAfterGc()),
+        workerLoaderIdleTtl(conf.getWorkerLoaderIdleTtlMs() * kj::MILLISECONDS),
         nextPressureCollection(server.timer.now()),
         pumpTasks(*this) {}
 
   static bool isEnabled(config::MemoryOptions::Reader conf) {
-    return conf.getIdleIsolateGcDelayMs() > 0 || conf.getPressureThresholdMb() > 0;
+    return conf.getIdleIsolateGcDelayMs() > 0 || conf.getPressureThresholdMb() > 0 ||
+        conf.getWorkerLoaderIdleTtlMs() > 0;
   }
 
   void start() {
@@ -5633,6 +5666,7 @@ class Server::MemoryMaintenance final: private kj::TaskSet::ErrorHandler {
   uint64_t pressureThresholdBytes;
   kj::Duration pressureCooldown;
   bool releaseMemoryAfterGc;
+  kj::Duration workerLoaderIdleTtl;
   kj::TimePoint nextPressureCollection;
 
   // Set when a collection finished since the last time free malloc memory was released.
@@ -5657,6 +5691,21 @@ class Server::MemoryMaintenance final: private kj::TaskSet::ErrorHandler {
 
   kj::Promise<void> sweep() {
     auto now = server.timer.now();
+
+    // Unload unused named Worker loader isolates first. Their teardown is deferred to a later
+    // turn of the event loop; the weak references below notice once they are gone.
+    if (workerLoaderIdleTtl > 0 * kj::MILLISECONDS) {
+      uint evicted = 0;
+      for (auto& loader: server.workerLoaderNamespaces) {
+        evicted += loader.value->evictIdle(now, workerLoaderIdleTtl);
+      }
+      for (auto& loader: server.anonymousWorkerLoaderNamespaces) {
+        evicted += loader->evictIdle(now, workerLoaderIdleTtl);
+      }
+      if (evicted > 0) {
+        KJ_LOG(INFO, "executor: unloaded idle Worker loader isolates", evicted);
+      }
+    }
 
     // Forget destroyed isolates, note which ones were active since the last sweep, and pick the
     // ones that have been idle long enough.
