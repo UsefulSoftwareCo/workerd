@@ -129,9 +129,9 @@ jobs:
           path: /tmp/artifacts
           run-id: ${{ steps.source.outputs.run }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
-      - name: Package and publish
+      - name: Package
+        id: package
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SHA: ${{ steps.source.outputs.sha }}
         run: |
           set -euo pipefail
@@ -145,6 +145,24 @@ jobs:
           cd /tmp/release
           sha256sum workerd-linux-64 workerd-linux-arm64 workerd-linux-64.gz workerd-linux-arm64.gz > SHA256SUMS
           cat SHA256SUMS
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+      # Keep the exact release files even if publishing fails.
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-files
+          path: /tmp/release/
+      # UsefulSoftwareCo disables write permissions for workflow tokens, so GITHUB_TOKEN cannot
+      # create releases there. Until an organization admin allows it (or a release token secret
+      # is added), this step fails and the release is created from the release-files artifact.
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SHA: ${{ steps.source.outputs.sha }}
+          tag: ${{ steps.package.outputs.tag }}
+        run: |
+          set -euo pipefail
+          cd /tmp/release
+          base="${tag%%-executor.*}"
           notes="Executor build of workerd ${base}, built from ${SHA} on ${GITHUB_REF_NAME}. See EXECUTOR.md on that commit for the patches applied on top of upstream ${base}."
           if gh release view "$tag" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release upload "$tag" -R "$GITHUB_REPOSITORY" workerd-linux-64.gz workerd-linux-arm64.gz SHA256SUMS --clobber

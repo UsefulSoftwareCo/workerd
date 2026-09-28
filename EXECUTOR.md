@@ -19,5 +19,10 @@ The patches only change behavior when enabled through `Config.memory` in `worker
 to an `executor/**` branch, runs `.github/executor/smoke-test.sh` against them, and publishes a
 GitHub release tagged `<upstream tag>-executor.<commit>` with gzipped binaries and `SHA256SUMS`.
 
+UsefulSoftwareCo disables write permissions for workflow tokens, so the publish step cannot
+create the release. The workflow uploads the packaged files as the `release-files` artifact, and
+the release is created from that artifact with `gh release create` until an organization admin
+allows write permissions (or a release token secret is added).
+
 The build uses standard GitHub-hosted runners and the Actions cache for Bazel's disk cache; there
-is no remote cache. A cold build takes several hours.
+is no remote cache. A cold build takes about two hours.
