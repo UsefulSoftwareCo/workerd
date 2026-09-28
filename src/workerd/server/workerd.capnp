@@ -138,13 +138,18 @@ struct MemoryOptions {
   # seconds out, so this must cover more than one reducer cycle to be useful.
 
   pressureThresholdMb @4 :UInt64 = 0;
-  # When non-zero, the maintenance loop reads the process memory usage (the cgroup v2
-  # memory.current of the process when available, otherwise its resident set size) and, when it
-  # exceeds this many MiB, runs a full GC (LowMemoryNotification) in every live isolate.
+  # When non-zero, the maintenance loop reads the process memory usage (the working set of the
+  # process's cgroup v2 when available: memory.current minus inactive_file from memory.stat;
+  # otherwise its resident set size) and, when it exceeds this many MiB, starts a pass that runs
+  # a full GC (LowMemoryNotification) in every live isolate that has run since its last full
+  # collection. These collections block the event loop, so a pass spends at most
+  # `pressureGcBudgetMs` per maintenance interval and continues on the next one.
   # 0 disables this.
 
   pressureCooldownMs @5 :UInt32 = 30000;
-  # Minimum time between two memory pressure collections triggered by `pressureThresholdMb`.
+  # Time between the end of a memory pressure pass and the next one. When a pass ends with usage
+  # still above `pressureThresholdMb`, the wait doubles (up to 16 times this value); it resets
+  # once usage is below the threshold.
 
   tcmallocBackgroundReleaseBytesPerSecond @6 :UInt64 = 0;
   # When non-zero, start a thread that runs TCMalloc's background actions and set TCMalloc's
@@ -169,6 +174,12 @@ struct MemoryOptions {
   #
   # A Worker also counts as referenced while it has ctx.waitUntil() work or an actor running, so
   # background work is never cut off; the TTL starts once that work has finished.
+
+  pressureGcBudgetMs @9 :UInt32 = 100;
+  # Event loop time a memory pressure pass (see `pressureThresholdMb`) may spend per maintenance
+  # interval. It stops starting collections once this much time has passed and continues with the
+  # remaining isolates on the next interval. A single collection can take longer. 0 means no
+  # limit: the whole pass runs at once.
 }
 
 struct LoggingOptions {

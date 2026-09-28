@@ -56,6 +56,7 @@
 #include <kj/encoding.h>
 #include <kj/glob-filter.h>
 #include <kj/map.h>
+#include <kj/time.h>
 
 #include <cstdlib>
 #include <ctime>
@@ -5587,8 +5588,11 @@ void Server::unlinkWorkerLoaders() {
 // MemoryMaintenance watches isolates for idleness (their lock count stops changing) and, once
 // one has been idle for `idleIsolateGcDelayMs`, runs a collection in it and keeps pumping its
 // foreground tasks for a while so that the collection and the memory reducer can finish.
-// Optionally, it also runs a full GC in every isolate when the process's memory usage crosses
-// `pressureThresholdMb`.
+// Optionally, it also runs a full GC in the isolates when the process's memory usage crosses
+// `pressureThresholdMb`. Those collections run on the event loop thread and block every request
+// while they run, so a pass spends at most `pressureGcBudgetMs` per sweep, skips isolates that
+// have not run since they were last collected, and waits longer between passes while they do
+// not bring usage back under the threshold.
 //
 // All of this is off unless configured in `Config.memory`.
 
@@ -5634,6 +5638,8 @@ class Server::MemoryMaintenance final: private kj::TaskSet::ErrorHandler {
         idleTaskPump(conf.getIdleTaskPumpMs() * kj::MILLISECONDS),
         pressureThresholdBytes(conf.getPressureThresholdMb() * 1024 * 1024),
         pressureCooldown(conf.getPressureCooldownMs() * kj::MILLISECONDS),
+        pressureGcBudget(conf.getPressureGcBudgetMs() * kj::MILLISECONDS),
+        currentPressureCooldown(pressureCooldown),
         releaseMemoryAfterGc(conf.getReleaseMemoryAfterGc()),
         workerLoaderIdleTtl(conf.getWorkerLoaderIdleTtlMs() * kj::MILLISECONDS),
         nextPressureCollection(server.timer.now()),
@@ -5678,6 +5684,10 @@ class Server::MemoryMaintenance final: private kj::TaskSet::ErrorHandler {
 
     // True while a pumpWhileIdle() task runs for this isolate.
     bool pumping = false;
+
+    // Lock count right after this isolate's last full collection. A memory pressure pass skips
+    // the isolate while the count is unchanged: nothing ran, so there is nothing new to free.
+    kj::Maybe<uint> collectedAtLockCount;
   };
 
   Server& server;
@@ -5687,6 +5697,15 @@ class Server::MemoryMaintenance final: private kj::TaskSet::ErrorHandler {
   kj::Duration idleTaskPump;
   uint64_t pressureThresholdBytes;
   kj::Duration pressureCooldown;
+  kj::Duration pressureGcBudget;
+
+  // Wait after the current pass: `pressureCooldown`, doubled after every pass that ends with
+  // usage still above the threshold (up to 16 times), and reset once usage is below it.
+  kj::Duration currentPressureCooldown;
+
+  // Isolates the current memory pressure pass has yet to visit. Empty between passes.
+  kj::Vector<kj::Rc<IsolateEntry>> pressureQueue;
+  uint pressurePassCollected = 0;
   bool releaseMemoryAfterGc;
   kj::Duration workerLoaderIdleTtl;
   kj::TimePoint nextPressureCollection;
@@ -5753,13 +5772,8 @@ class Server::MemoryMaintenance final: private kj::TaskSet::ErrorHandler {
       co_await collectIdle(entry.addRef());
     }
 
-    if (pressureThresholdBytes > 0 && now >= nextPressureCollection) {
-      KJ_IF_SOME(usage, readMemoryUsage()) {
-        if (usage > pressureThresholdBytes) {
-          nextPressureCollection = now + pressureCooldown;
-          co_await collectAll(usage);
-        }
-      }
+    if (pressureThresholdBytes > 0) {
+      co_await relievePressure(now);
     }
 
     // Collections free V8 heap pages directly, but native objects owned by collected JavaScript
@@ -5787,8 +5801,9 @@ class Server::MemoryMaintenance final: private kj::TaskSet::ErrorHandler {
       // next sweep notices the activity and starts the idle timer over.
       if (isolate->getLockSuccessCount() != entry->lastLockCount) co_return;
 
+      bool stillCollected = isCollectedAt(*entry, entry->lastLockCount);
       isolate->runInLockScope(asyncLock, [&](jsg::Lock& js) {
-        pumpForegroundTasks(js);
+        pumpForegroundTasks(js, *isolate);
         if (full) {
           js.v8Isolate->LowMemoryNotification();
         } else {
@@ -5796,9 +5811,10 @@ class Server::MemoryMaintenance final: private kj::TaskSet::ErrorHandler {
           // to "moderate" starts a new memory-reducing incremental marking cycle.
           js.v8Isolate->MemoryPressureNotification(v8::MemoryPressureLevel::kModerate);
         }
-        pumpForegroundTasks(js);
+        pumpForegroundTasks(js, *isolate);
       });
       entry->lastLockCount = isolate->getLockSuccessCount();
+      if (full || stillCollected) entry->collectedAtLockCount = entry->lastLockCount;
     }
     entry->collected = true;
     releasePending = true;
@@ -5836,42 +5852,117 @@ class Server::MemoryMaintenance final: private kj::TaskSet::ErrorHandler {
 
       auto asyncLock = co_await isolate->takeAsyncLockWithoutRequest(nullptr);
       if (isolate->getLockSuccessCount() != entry->lastLockCount) co_return;
-      isolate->runInLockScope(asyncLock, [&](jsg::Lock& js) { pumpForegroundTasks(js); });
+      bool stillCollected = isCollectedAt(*entry, entry->lastLockCount);
+      isolate->runInLockScope(
+          asyncLock, [&](jsg::Lock& js) { pumpForegroundTasks(js, *isolate); });
       entry->lastLockCount = isolate->getLockSuccessCount();
+      // Our own lock is not activity: a full collection before it still covers the isolate.
+      if (stillCollected) entry->collectedAtLockCount = entry->lastLockCount;
     }
   }
 
-  kj::Promise<void> collectAll(uint64_t usage) {
-    KJ_LOG(INFO, "executor: memory usage above threshold, collecting all isolates", usage,
-        pressureThresholdBytes);
-    auto entries = KJ_MAP(e, isolates) { return e.addRef(); };
-    for (auto& entry: entries) {
-      kj::Own<const Worker::Isolate> isolate;
-      KJ_IF_SOME(i, entry->ref->tryAddStrongRef()) {
-        isolate = kj::mv(i);
+  // True when the isolate's last full collection happened at lock count `count`.
+  static bool isCollectedAt(const IsolateEntry& entry, uint count) {
+    KJ_IF_SOME(collectedAt, entry.collectedAtLockCount) {
+      return collectedAt == count;
+    }
+    return false;
+  }
+
+  // One step of the memory pressure handling, run once per sweep. Starts a pass over all isolates
+  // when usage is above the threshold and the cooldown has passed, then collects isolates from the
+  // pass until `pressureGcBudget` is spent; the rest wait for the next sweep, so requests get the
+  // event loop in between. When a pass has visited every isolate, the next one waits for the
+  // cooldown, which doubles while the passes leave usage above the threshold.
+  kj::Promise<void> relievePressure(kj::TimePoint now) {
+    if (pressureQueue.empty()) {
+      if (now < nextPressureCollection) co_return;
+      KJ_IF_SOME(usage, readMemoryUsage()) {
+        if (usage <= pressureThresholdBytes) {
+          currentPressureCooldown = pressureCooldown;
+          co_return;
+        }
+        KJ_LOG(INFO, "executor: memory usage above threshold, collecting isolates", usage,
+            pressureThresholdBytes);
+        pressureQueue = KJ_MAP(e, isolates) { return e.addRef(); };
+        pressurePassCollected = 0;
       } else {
-        continue;
-      }
-      auto asyncLock = co_await isolate->takeAsyncLockWithoutRequest(nullptr);
-      bool wasIdle = isolate->getLockSuccessCount() == entry->lastLockCount;
-      isolate->runInLockScope(asyncLock, [&](jsg::Lock& js) {
-        js.v8Isolate->LowMemoryNotification();
-        pumpForegroundTasks(js);
-      });
-      entry->lastLockCount = isolate->getLockSuccessCount();
-      releasePending = true;
-      if (!wasIdle) {
-        entry->lastActive = server.timer.now();
-        entry->collected = false;
+        co_return;
       }
     }
+
+    auto& clock = kj::systemPreciseMonotonicClock();
+    auto start = clock.now();
+    size_t visited = 0;
+    while (visited < pressureQueue.size()) {
+      if (pressureGcBudget > 0 * kj::MILLISECONDS && visited > 0 &&
+          clock.now() - start >= pressureGcBudget) {
+        break;
+      }
+      auto entry = pressureQueue[visited++].addRef();
+      if (co_await collectUnderPressure(kj::mv(entry))) ++pressurePassCollected;
+    }
+    pressureQueue = KJ_MAP(e, pressureQueue.slice(visited, pressureQueue.size())) {
+      return e.addRef();
+    };
+    if (!pressureQueue.empty()) co_return;
+
+    // The pass is over.
+    bool relieved = true;
+    uint64_t usage = 0;
+    KJ_IF_SOME(u, readMemoryUsage()) {
+      usage = u;
+      relieved = usage <= pressureThresholdBytes;
+    }
+    if (relieved) {
+      currentPressureCooldown = pressureCooldown;
+    } else {
+      currentPressureCooldown = kj::min(currentPressureCooldown * 2, pressureCooldown * 16);
+    }
+    nextPressureCollection = server.timer.now() + currentPressureCooldown;
+    uint collected = pressurePassCollected;
+    kj::Duration nextPassIn = currentPressureCooldown;
+    KJ_LOG(INFO, "executor: memory pressure pass done", collected, usage, nextPassIn);
   }
 
-  // Runs the isolate's pending V8 foreground tasks, the same way IoContext does at the end of a
-  // request: without an IoContext, running microtasks queued by FinalizationRegistry callbacks.
-  static void pumpForegroundTasks(jsg::Lock& js) {
+  // Runs a full GC in one isolate for the memory pressure pass. Returns false when the isolate is
+  // gone or has not run since its last full collection.
+  kj::Promise<bool> collectUnderPressure(kj::Rc<IsolateEntry> entry) {
+    kj::Own<const Worker::Isolate> isolate;
+    KJ_IF_SOME(i, entry->ref->tryAddStrongRef()) {
+      isolate = kj::mv(i);
+    } else {
+      co_return false;
+    }
+    if (isCollectedAt(*entry, isolate->getLockSuccessCount())) co_return false;
+
+    auto asyncLock = co_await isolate->takeAsyncLockWithoutRequest(nullptr);
+    bool wasIdle = isolate->getLockSuccessCount() == entry->lastLockCount;
+    isolate->runInLockScope(asyncLock, [&](jsg::Lock& js) {
+      js.v8Isolate->LowMemoryNotification();
+      pumpForegroundTasks(js, *isolate);
+    });
+    entry->lastLockCount = isolate->getLockSuccessCount();
+    entry->collectedAtLockCount = entry->lastLockCount;
+    releasePending = true;
+    if (!wasIdle) {
+      entry->lastActive = server.timer.now();
+      entry->collected = false;
+    }
+    co_return true;
+  }
+
+  // Runs the isolate's pending V8 foreground tasks, like IoContext does at the end of a request
+  // (io-context.c++): without an IoContext, running microtasks queued by FinalizationRegistry
+  // callbacks. That loop stops once the request's LimitEnforcer reports exceeded limits. There is
+  // no request here, so this checks the isolate's heap limit instead, and it also stops after
+  // 10000 tasks. This may run while requests of the isolate are suspended, the same as a
+  // FinalizationRegistry callback running at the end of another request would. When JavaScript
+  // execution is terminated, it stops and does not pump again.
+  static void pumpForegroundTasks(jsg::Lock& js, const Worker::Isolate& isolate) {
     SuppressIoContextScope noIoContext;
     for (uint i = 0; i < 10000 && js.pumpMsgLoop(); ++i) {
+      if (isolate.getLimitEnforcer().hasExcessivelyExceededHeapLimit()) break;
       v8::TryCatch tryCatch(js.v8Isolate);
       js.runMicrotasks();
       if (tryCatch.HasCaught()) {
@@ -5881,9 +5972,11 @@ class Server::MemoryMaintenance final: private kj::TaskSet::ErrorHandler {
     }
   }
 
-  // Returns the memory charged to this process: the cgroup v2 memory.current of the process's
-  // cgroup when available (what a container memory limit is enforced against), otherwise the
-  // resident set size. Returns none when neither can be read (e.g. not on Linux).
+  // Returns the memory this process is using: the working set of the process's cgroup v2 when
+  // available (memory.current, which a container memory limit is enforced against, minus the
+  // inactive file cache in memory.stat, which the kernel reclaims before it would kill anything;
+  // docker stats and the kubelet compute it the same way), otherwise the resident set size.
+  // Returns none when neither can be read (e.g. not on Linux).
   static kj::Maybe<uint64_t> readMemoryUsage() {
 #if __linux__
     auto readFile = [](kj::StringPtr path) -> kj::Maybe<kj::String> {
@@ -5903,9 +5996,21 @@ class Server::MemoryMaintenance final: private kj::TaskSet::ErrorHandler {
         const char* start = line + 3;
         const char* end = strchr(start, '\n');
         size_t length = end == nullptr ? strlen(start) : end - start;
-        auto path = kj::str("/sys/fs/cgroup", kj::arrayPtr(start, length), "/memory.current");
-        KJ_IF_SOME(current, readFile(path)) {
-          return strtoull(current.cStr(), nullptr, 10);
+        auto dir = kj::str("/sys/fs/cgroup", kj::arrayPtr(start, length));
+        KJ_IF_SOME(current, readFile(kj::str(dir, "/memory.current"))) {
+          uint64_t usage = strtoull(current.cStr(), nullptr, 10);
+          KJ_IF_SOME(stat, readFile(kj::str(dir, "/memory.stat"))) {
+            const char* text = stat.cStr();
+            const char* field = strncmp(text, "inactive_file ", 14) == 0
+                ? text
+                : strstr(text, "\ninactive_file ");
+            if (field != nullptr) {
+              if (*field == '\n') ++field;
+              uint64_t inactive = strtoull(field + 14, nullptr, 10);
+              usage = inactive < usage ? usage - inactive : 0;
+            }
+          }
+          return usage;
         }
       }
     }

@@ -124,6 +124,9 @@ expect "http://127.0.0.1:18083/?name=a" 1
 expect_log full "executor: collected idle isolate.*full"
 if [ "$(uname -s)" = "Linux" ]; then
   expect_log full "executor: memory usage above threshold"
+  expect_log full "executor: memory pressure pass done"
+  # Once every isolate is idle and has had its full collection, later passes skip them all.
+  expect_log full "executor: memory pressure pass done; collected = 0"
   expect_log full "executor: TCMalloc background release enabled"
   expect_log full "executor: released free malloc memory to the OS"
 fi
