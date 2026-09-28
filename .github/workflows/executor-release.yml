@@ -12,13 +12,18 @@ on:
     branches:
       - 'executor/**'
   workflow_dispatch:
+    inputs:
+      from_run:
+        description: 'Publish the binaries of this earlier run instead of building (run ID)'
+        required: false
+        default: ''
 
 permissions:
   contents: write
   actions: write
 
 concurrency:
-  group: executor-release-${{ github.ref }}
+  group: executor-release-${{ github.ref }}-${{ inputs.from_run }}
   cancel-in-progress: false
 
 jobs:
@@ -33,6 +38,7 @@ jobs:
           - arch: linux-arm64
             image: ubuntu-22.04-arm
     name: build (${{ matrix.arch }})
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.from_run == '' }}
     runs-on: ${{ matrix.image }}
     timeout-minutes: 360
     steps:
@@ -45,13 +51,17 @@ jobs:
             /opt/hostedtoolcache/CodeQL /usr/local/share/boost /usr/share/swift || true
           sudo docker image prune --all --force || true
           df -h /
+      # Computed once, before Setup Runner appends toolchain paths to .bazelrc, so that the key
+      # used to save the cache matches the one used to restore it.
+      - name: Cache key
+        id: cache-key
+        run: echo "prefix=executor-bazel-${{ matrix.arch }}-${{ hashFiles('.bazelversion', '.bazelrc', 'MODULE.bazel', 'build/deps/gen/*.bzl', 'build/deps/gen/*.bazel') }}-" >> "$GITHUB_OUTPUT"
       - name: Restore Bazel disk cache
         uses: actions/cache/restore@v5
         with:
           path: ~/bazel-disk-cache
-          key: executor-bazel-${{ matrix.arch }}-${{ hashFiles('.bazelversion', '.bazelrc', 'MODULE.bazel', 'build/deps/gen/*.bzl', 'build/deps/gen/*.bazel') }}-${{ github.sha }}
-          restore-keys: |
-            executor-bazel-${{ matrix.arch }}-${{ hashFiles('.bazelversion', '.bazelrc', 'MODULE.bazel', 'build/deps/gen/*.bzl', 'build/deps/gen/*.bazel') }}-
+          key: ${{ steps.cache-key.outputs.prefix }}${{ github.sha }}
+          restore-keys: ${{ steps.cache-key.outputs.prefix }}
       - name: Setup Runner
         uses: ./.github/actions/setup-runner
         with:
@@ -92,23 +102,41 @@ jobs:
         uses: actions/cache/save@v5
         with:
           path: ~/bazel-disk-cache
-          key: executor-bazel-${{ matrix.arch }}-${{ hashFiles('.bazelversion', '.bazelrc', 'MODULE.bazel', 'build/deps/gen/*.bzl', 'build/deps/gen/*.bazel') }}-${{ github.sha }}
+          key: ${{ steps.cache-key.outputs.prefix }}${{ github.sha }}
 
   release:
     needs: build
+    if: ${{ !cancelled() && (needs.build.result == 'success' || (needs.build.result == 'skipped' && inputs.from_run != '')) }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
-      - uses: actions/download-artifact@v8
-        with:
-          path: /tmp/artifacts
-      - name: Package and publish
+      - name: Resolve the built commit
+        id: source
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          if [ -n "${{ inputs.from_run }}" ]; then
+            echo "run=${{ inputs.from_run }}" >> "$GITHUB_OUTPUT"
+            echo "sha=$(gh api repos/$GITHUB_REPOSITORY/actions/runs/${{ inputs.from_run }} --jq .head_sha)" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=$GITHUB_RUN_ID" >> "$GITHUB_OUTPUT"
+            echo "sha=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ steps.source.outputs.sha }}
+      - uses: actions/download-artifact@v8
+        with:
+          path: /tmp/artifacts
+          run-id: ${{ steps.source.outputs.run }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Package and publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SHA: ${{ steps.source.outputs.sha }}
+        run: |
           set -euo pipefail
-          base="v$(cat src/workerd/io/release-version.txt | tr -d '-' | sed 's/^/1./').1"
-          tag="${base}-executor.$(git rev-parse --short=10 HEAD)"
+          base="v1.$(tr -d '-' < src/workerd/io/release-version.txt).1"
+          tag="${base}-executor.${SHA:0:10}"
           mkdir -p /tmp/release
           for arch in linux-64 linux-arm64; do
             install -m 755 /tmp/artifacts/workerd-$arch/workerd /tmp/release/workerd-$arch
@@ -117,10 +145,10 @@ jobs:
           cd /tmp/release
           sha256sum workerd-linux-64 workerd-linux-arm64 workerd-linux-64.gz workerd-linux-arm64.gz > SHA256SUMS
           cat SHA256SUMS
-          notes="Executor build of workerd ${base} from ${GITHUB_REF_NAME} at ${GITHUB_SHA}. See the branch history for the patches applied on top of upstream ${base}."
-          if gh release view "$tag" >/dev/null 2>&1; then
-            gh release upload "$tag" workerd-linux-64.gz workerd-linux-arm64.gz SHA256SUMS --clobber
+          notes="Executor build of workerd ${base}, built from ${SHA} on ${GITHUB_REF_NAME}. See EXECUTOR.md on that commit for the patches applied on top of upstream ${base}."
+          if gh release view "$tag" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$tag" -R "$GITHUB_REPOSITORY" workerd-linux-64.gz workerd-linux-arm64.gz SHA256SUMS --clobber
           else
-            gh release create "$tag" workerd-linux-64.gz workerd-linux-arm64.gz SHA256SUMS \
-              --target "$GITHUB_SHA" --title "$tag" --notes "$notes"
+            gh release create "$tag" -R "$GITHUB_REPOSITORY" workerd-linux-64.gz workerd-linux-arm64.gz SHA256SUMS \
+              --target "$SHA" --title "$tag" --notes "$notes"
           fi
