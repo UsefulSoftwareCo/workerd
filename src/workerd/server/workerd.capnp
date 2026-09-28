@@ -94,6 +94,57 @@ struct Config {
 
   logging @6 : LoggingOptions;
   # Console and Stdio logging configuration options.
+
+  memory @7 :MemoryOptions;
+  # Executor fork: process-level memory management. Every option defaults to upstream behavior,
+  # so leaving this unset changes nothing.
+}
+
+struct MemoryOptions {
+  # Executor fork. workerd is designed to run many tenants on machines under constant memory
+  # pressure, where isolates are busy and V8 gets plenty of chances to collect garbage. A small
+  # self-hosted deployment is the opposite: most isolates sit idle for long stretches. V8 only
+  # runs its memory reducer from foreground tasks, and workerd only pumps those tasks at the end
+  # of a request, so an idle isolate keeps its peak heap indefinitely. These options let such
+  # deployments give memory back.
+
+  maintenanceIntervalMs @0 :UInt32 = 1000;
+  # How often the memory maintenance loop checks isolates for idleness. Only used when at least
+  # one of the features below is enabled.
+
+  idleIsolateGcDelayMs @1 :UInt32 = 0;
+  # When non-zero, an isolate that has not been locked (no requests, timers or other JavaScript
+  # activity) for this many milliseconds gets one garbage collection, as selected by
+  # `idleIsolateGcMode`, and its pending V8 foreground tasks are run for `idleTaskPumpMs`
+  # afterwards so that incremental marking and the memory reducer can finish. The isolate is not
+  # touched again until it has been active and gone idle again. 0 disables this.
+
+  idleIsolateGcMode @2 :IdleGcMode = moderate;
+  # What to do when an isolate goes idle.
+
+  enum IdleGcMode {
+    moderate @0;
+    # Send V8 a moderate memory pressure notification. V8 starts incremental marking with the
+    # "reduce memory footprint" flag, which completes over the following foreground tasks.
+
+    full @1;
+    # Call LowMemoryNotification(): a synchronous full GC that also compacts and releases unused
+    # pages. More effective, but pauses the event loop for the duration of the collection.
+  }
+
+  idleTaskPumpMs @3 :UInt32 = 30000;
+  # After the idle GC, keep running the isolate's pending V8 foreground tasks for this long while
+  # it stays idle. The memory reducer schedules its follow-up work as delayed tasks several
+  # seconds out, so this must cover more than one reducer cycle to be useful.
+
+  pressureThresholdMb @4 :UInt64 = 0;
+  # When non-zero, the maintenance loop reads the process memory usage (the cgroup v2
+  # memory.current of the process when available, otherwise its resident set size) and, when it
+  # exceeds this many MiB, runs a full GC (LowMemoryNotification) in every live isolate.
+  # 0 disables this.
+
+  pressureCooldownMs @5 :UInt32 = 30000;
+  # Minimum time between two memory pressure collections triggered by `pressureThresholdMb`.
 }
 
 struct LoggingOptions {

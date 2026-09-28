@@ -77,4 +77,33 @@ expect "http://127.0.0.1:18081/?name=a" 2
 sleep 3
 expect "http://127.0.0.1:18081/?name=a" 3
 
+# expect_log NAME PATTERN: waits up to 10s for PATTERN in the workerd log.
+expect_log() {
+  for _ in $(seq 1 100); do
+    if grep -q "$2" "$DIR/$1.log"; then echo "ok: $1 log has '$2'"; return 0; fi
+    sleep 0.1
+  done
+  cat "$DIR/$1.log"
+  echo "FAIL: $1 log is missing '$2'" >&2
+  exit 1
+}
+
+# Idle-isolate GC (moderate): after the isolates go idle they get collected, and they still
+# serve requests afterwards with their state intact.
+write_config idle 18082 "memory = (maintenanceIntervalMs = 100, idleIsolateGcDelayMs = 500, idleTaskPumpMs = 1000),"
+start idle 18082
+expect "http://127.0.0.1:18082/?name=a" 1
+expect_log idle "executor: collected idle isolate.*moderate"
+expect "http://127.0.0.1:18082/?name=a" 2
+
+# Idle-isolate GC (full) and the memory pressure path. A 1 MiB threshold is always exceeded.
+write_config full 18083 "memory = (maintenanceIntervalMs = 100, idleIsolateGcDelayMs = 500, idleIsolateGcMode = full, pressureThresholdMb = 1, pressureCooldownMs = 500),"
+start full 18083
+expect "http://127.0.0.1:18083/?name=a" 1
+expect_log full "executor: collected idle isolate.*full"
+if [ "$(uname -s)" = "Linux" ]; then
+  expect_log full "executor: memory usage above threshold"
+fi
+expect "http://127.0.0.1:18083/?name=a" 2
+
 echo "smoke test passed"

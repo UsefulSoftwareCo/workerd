@@ -227,6 +227,12 @@ class Server final: private kj::TaskSet::ErrorHandler, private ChannelTokenHandl
   // Especially includes server loop tasks to listen on sockets. Any error is considered fatal.
   kj::TaskSet tasks;
 
+  // Executor fork: idle-isolate and memory-pressure garbage collection, configured by
+  // `Config.memory`. Null when no memory option is enabled. Declared after `tasks` so that it is
+  // destroyed first; it only holds weak references to isolates.
+  class MemoryMaintenance;
+  kj::Maybe<kj::Own<MemoryMaintenance>> memoryMaintenance;
+
   // Reports an exception thrown by a task in `tasks`.
   void taskFailed(kj::Exception&& exception) override;
 
