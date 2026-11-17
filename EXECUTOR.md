@@ -52,8 +52,12 @@ in `src/workerd/server/factory/`), the patches are split along that boundary:
 `.github/workflows/executor-release.yml` builds Linux x64 and arm64 release binaries on every push
 to an `executor/**` branch, runs `.github/executor/smoke-test.sh` against them, and publishes a
 GitHub release tagged `<upstream tag>-executor.<commit>` with gzipped binaries and `SHA256SUMS`.
-Consumers pin those files by SHA-256, so a published release is never changed: a re-run only adds
-files a failed attempt left out, and fails if the release has a different `SHA256SUMS`.
+Consumers pin those files by SHA-256, so a published file is never changed. When the release
+already exists, a re-run checks each file it has against this build and fails if any differs; it
+then uploads the files a failed attempt left out (`SHA256SUMS` last), and succeeds only once both
+archives and `SHA256SUMS` are there. The build is not known to be reproducible bit for bit, so a
+re-run that rebuilds may be refused; to complete a partial release, use `from_run` with the run
+that published its first files.
 
 The release job first uploads the packaged files as the `release-files` artifact. Workflow tokens
 in UsefulSoftwareCo default to read-only; two runs were refused release creation (HTTP 403) before
