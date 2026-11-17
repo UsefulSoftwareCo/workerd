@@ -31,6 +31,8 @@ in `src/workerd/server/factory/`), the patches are split along that boundary:
   as used while its `Rc<WorkerStub>` has another owner, or while `worker_has_pending_work` reports
   a request, `ctx.waitUntil()` work or an actor.
 - `factory/worker-factory-rpc.c++` (`InspectorService::registerIsolate`): the inspector fix.
+  Inspector-enabled reload support is for development use. Keep the inspector disabled in
+  production; Executor's image does not pass `--inspector-addr`.
 
 ### Notes on the memory patches
 
