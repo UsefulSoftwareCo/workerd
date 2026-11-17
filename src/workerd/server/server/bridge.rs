@@ -704,6 +704,10 @@ pub mod ffi {
         /// creates afterwards registers with it. Returns the bound port.
         fn factory_start_inspector(factory: &WorkerFactory, address: &str) -> Result<u16>;
 
+        /// Executor fork: starts the memory maintenance that `Config.memory` configures, if any.
+        /// Every isolate the factory creates afterwards is watched.
+        fn factory_start_memory_maintenance(factory: &WorkerFactory);
+
         // The listeners' shims (worker-factory-listen.c++).
 
         /// A copy of `headers` with `edits` and then `injected` applied in order.

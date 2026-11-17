@@ -163,6 +163,12 @@ async fn start(
         control.listen_inspector(port);
     }
 
+    // Executor fork: memory maintenance starts before any isolate exists, so that every isolate
+    // is watched. `workerd test` and `workerd bench` run without it.
+    if !for_test {
+        ffi::factory_start_memory_maintenance(factory.raw());
+    }
+
     // The cluster port is bound before the services, like the sockets: its address goes in the
     // lease record.
     let cluster_port = if config.has_cluster() {

@@ -6,6 +6,7 @@
 
 // The private state behind worker-factory.h, shared by the factory's source files.
 
+#include "memory-maintenance.h"
 #include "worker-factory.h"
 
 #include <workerd/api/bench.h>
@@ -134,6 +135,11 @@ class WorkerFactory::Impl final: private kj::TaskSet::ErrorHandler {
   kj::TaskSet tasks;
   // How many tasks factory_spawn has added; factory_settle_tasks waits for it to stop growing.
   uint64_t spawnCount = 0;
+
+  // Executor fork: idle-isolate and memory-pressure garbage collection, configured by
+  // `Config.memory`. Null when no memory option is enabled. Declared after `tasks` so that it is
+  // destroyed first; it only holds weak references to isolates.
+  kj::Maybe<kj::Own<MemoryMaintenance>> memoryMaintenance;
 
   const ServerHandle& getServer() const;
 

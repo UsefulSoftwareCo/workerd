@@ -447,6 +447,7 @@ inline uint64_t actor_predecessor_rejected_detail_id() {
 }
 
 uint16_t factory_start_inspector(const WorkerFactory& factory, ::rust::Str address);
+void factory_start_memory_maintenance(const WorkerFactory& factory);
 
 // The listeners' shims (worker-factory-listen.c++).
 kj::Own<kj::HttpHeaders> edit_headers(const kj::HttpHeaderTable& table,

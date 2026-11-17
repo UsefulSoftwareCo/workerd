@@ -1797,6 +1797,10 @@ kj::Promise<kj::Own<CompiledWorker>> compileWorker(const WorkerFactory& constFac
   KJ_IF_SOME(r, registrar) {
     r.registerIsolate(impl->name, *isolate);
   }
+  // Executor fork: let the memory maintenance loop watch this isolate for idleness.
+  KJ_IF_SOME(mm, factory.memoryMaintenance) {
+    mm->registerIsolate(impl->name, *isolate);
+  }
 
   if (!usingNewModuleRegistry) {
     KJ_IF_SOME(fallback, moduleFallback) {
@@ -1950,6 +1954,17 @@ bool factory_assets_navigation_prefers_asset_serving(
     kj::throwFatalException(KJ_EXCEPTION(FAILED, kj::strArray(errorReporter.errors, "; ")));
   }
   return flags.getAssetsSecFetchModeNavigateHeaderPrefersAssetServing();
+}
+
+void factory_start_memory_maintenance(const WorkerFactory& constFactory) {
+  auto& factory = constFactory.getImpl();
+  auto config = factory.config;
+  if (factory.memoryMaintenance != kj::none || !config.hasMemory()) return;
+  if (MemoryMaintenance::isEnabled(config.getMemory())) {
+    auto mm = kj::heap<MemoryMaintenance>(factory.timer, config.getMemory());
+    mm->start();
+    factory.memoryMaintenance = kj::mv(mm);
+  }
 }
 
 WorkerInfo worker_info(const CompiledWorker& worker) {

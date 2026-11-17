@@ -32,6 +32,9 @@ wd_cc_library(
         "worker-factory-impl.h",
         "worker-factory-listen.c++",
         "worker-factory-rpc.c++",
+        # Executor fork.
+        "memory-maintenance.c++",
+        "memory-maintenance.h",
     ],
     linkstatic = CC_LIBRARY_LINKSTATIC,
     deps = [
