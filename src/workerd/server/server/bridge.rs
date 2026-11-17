@@ -106,6 +106,9 @@ pub mod ffi {
         /// actor classes. The factory serves these numbers itself. Zero for a config worker.
         env_subrequest_channels: u32,
         env_actor_classes: u32,
+        /// Executor fork: whether a dynamic worker's top-level evaluation exceeded the slice
+        /// limit (`Config.dynamicWorkerLimits`), which then is among its errors.
+        startup_exceeded_cpu: bool,
     }
 
     struct WorkerSpec {

@@ -35,6 +35,8 @@ wd_cc_library(
         # Executor fork.
         "memory-maintenance.c++",
         "memory-maintenance.h",
+        "slice-limit.c++",
+        "slice-limit.h",
     ],
     linkstatic = CC_LIBRARY_LINKSTATIC,
     # Executor fork: memory-maintenance.c++ configures TCMalloc through its extension API when it

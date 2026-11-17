@@ -334,4 +334,163 @@ sleep 1.5
 expect_log inspector "executor: unloaded idle Worker loader isolates"
 expect "http://127.0.0.1:18085/?name=a" 1
 
+# Slice limit (Config.dynamicWorkerLimits): a separate parent whose loader children loop in
+# JavaScript, in WebAssembly or at their top level. limit-parent.js answers
+#   /health                       directly (a config Worker, never limited)
+#   /static-busy?n=N              after N loop iterations of its own (never limited)
+#   /?name=X&mode=M               by calling child X (modes: count, loop, wasm, busy&n=N, wait&ms=N)
+# with "<status> <elapsed ms> <body or error>". Date.now() does not advance while JavaScript runs,
+# so busy work is counted in loop iterations, calibrated below against wall time. The code for a
+# name changes from the second time the loader asks for it, so a fresh isolate is visible: "top"
+# loops at its top level only in its first isolate, and every child's counter restarts at 1.
+cat > "$DIR/limit-parent.js" <<'JS'
+import spinBytes from './spin.bin';
+const loads = {};
+const child = (name, first) => `import spin from './spin.wasm';
+let hits = 0;
+${name === 'top' && first ? 'for (;;) {}' : ''}
+export default { async fetch(request) {
+  hits += 1;
+  const url = new URL(request.url);
+  const mode = url.searchParams.get('mode');
+  if (mode === 'loop') { for (;;) {} }
+  if (mode === 'wasm') { new WebAssembly.Instance(spin).exports.spin(); }
+  if (mode === 'busy') { let x = 0; for (let i = 0, n = Number(url.searchParams.get('n')); i < n; i++) x += i; if (x < 0) hits = 0; }
+  if (mode === 'wait') { await new Promise((resolve) => setTimeout(resolve, Number(url.searchParams.get('ms')))); }
+  return new Response(String(hits));
+} }`;
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+    if (url.pathname === '/health') return new Response('ok');
+    if (url.pathname === '/static-busy') {
+      let x = 0;
+      for (let i = 0, n = Number(url.searchParams.get('n')); i < n; i++) x += i;
+      return new Response(x < 0 ? 'impossible' : 'static ok');
+    }
+    const name = url.searchParams.get('name') ?? 'child';
+    const stub = env.LOADER.get(name, () => {
+      loads[name] = (loads[name] ?? 0) + 1;
+      return {
+        compatibilityDate: '2026-01-01',
+        mainModule: 'child.js',
+        modules: { 'child.js': child(name, loads[name] === 1), 'spin.wasm': { wasm: spinBytes } },
+      };
+    });
+    const start = Date.now();
+    try {
+      const response = await stub.getEntrypoint().fetch('http://child/' + url.search);
+      return new Response(`${response.status} ${Date.now() - start} ${await response.text()}`);
+    } catch (e) {
+      return new Response(`error ${Date.now() - start} ${String(e)}`);
+    }
+  },
+};
+JS
+# (module (func (export "spin") (loop br 0)))
+printf '\x00\x61\x73\x6d\x01\x00\x00\x00\x01\x04\x01\x60\x00\x00\x03\x02\x01\x00\x07\x08\x01\x04\x73\x70\x69\x6e\x00\x00\x0a\x09\x01\x07\x00\x03\x40\x0c\x00\x0b\x0b' > "$DIR/spin.wasm"
+
+# write_limit_config NAME PORT EXTRA_CONFIG
+write_limit_config() {
+  cat > "$DIR/$1.capnp" <<CAPNP
+using Workerd = import "/workerd/workerd.capnp";
+const config :Workerd.Config = (
+  services = [
+    (name = "parent", worker = (
+      compatibilityDate = "2026-01-01",
+      modules = [(name = "parent.js", esModule = embed "limit-parent.js"),
+                 (name = "spin.bin", data = embed "spin.wasm")],
+      bindings = [(name = "LOADER", workerLoader = ())],
+    )),
+  ],
+  sockets = [(name = "http", address = "127.0.0.1:$2", http = (), service = "parent")],
+  $3
+);
+CAPNP
+}
+
+# expect_match URL REGEX: the response, on one line, must match REGEX (grep -E).
+expect_match() {
+  local got
+  got="$(curl -sf "$1" | tr '\n' ' ')"
+  if ! printf '%s' "$got" | grep -qE "$2"; then
+    echo "FAIL: $1 returned '$got', expected /$2/" >&2
+    exit 1
+  fi
+  echo "ok: $1 -> $got"
+}
+
+# expect_ms_between URL MIN MAX REGEX: the response matches REGEX and its elapsed field (the
+# second word) is within [MIN, MAX] ms.
+expect_ms_between() {
+  local got ms
+  got="$(curl -sf "$1" | tr '\n' ' ')"
+  ms="$(printf '%s' "$got" | awk '{print $2}')"
+  if ! printf '%s' "$got" | grep -qE "$4" || [ "$ms" -lt "$2" ] || [ "$ms" -gt "$3" ]; then
+    echo "FAIL: $1 returned '$got', expected /$4/ in $2..$3 ms" >&2
+    exit 1
+  fi
+  echo "ok: $1 -> $got"
+}
+
+# wall_ms URL: the wall time of a request, in ms.
+wall_ms() {
+  curl -sf -o /dev/null -w '%{time_total}' "$1" | awk '{printf "%d", $1 * 1000}'
+}
+
+CPU_ERROR='^error [0-9]+ .*exceeded CPU time limit'
+# Default config: no limit. Calibrate busy work against the static parent, then let a child and
+# the static parent each spin for about a second.
+L=18087
+write_limit_config nolimit $L ""
+start nolimit $L
+n=50000000
+while [ "$(wall_ms "http://127.0.0.1:$L/static-busy?n=$n")" -lt 200 ]; do n=$(( n * 2 )); done
+per_ms=$(( n / $(wall_ms "http://127.0.0.1:$L/static-busy?n=$n") ))
+[ "$per_ms" -gt 0 ] || { echo "FAIL: could not calibrate busy work" >&2; exit 1; }
+echo "ok: busy work runs about $per_ms iterations per ms"
+expect_match "http://127.0.0.1:$L/?name=a&mode=busy&n=$(( per_ms * 1000 ))" '^200 [0-9]+ 1$'
+expect_match "http://127.0.0.1:$L/static-busy?n=$(( per_ms * 1000 ))" '^static ok$'
+if grep -q "exceeded its CPU slice limit" "$DIR/nolimit.log"; then
+  cat "$DIR/nolimit.log"; echo "FAIL: default config limited a Worker" >&2; exit 1
+fi
+echo "ok: default config limited nothing"
+
+# A 500 ms limit.
+L=18088
+write_limit_config limit $L "dynamicWorkerLimits = (sliceCpuMs = 500),"
+start limit $L
+expect_match "http://127.0.0.1:$L/?name=a" '^200 [0-9]+ 1$'
+expect_match "http://127.0.0.1:$L/?name=b" '^200 [0-9]+ 1$'
+# A JavaScript loop ends at about the limit while the config Worker waits for the thread; the
+# failed name's next call starts a fresh isolate, and the other loader Worker keeps its state.
+curl -sf "http://127.0.0.1:$L/?name=a&mode=loop" > "$DIR/loop.out" &
+loop=$!
+sleep 0.1
+health_ms=$(wall_ms "http://127.0.0.1:$L/health")
+wait $loop
+got="$(cat "$DIR/loop.out")"
+printf '%s' "$got" | grep -qE "$CPU_ERROR" || { echo "FAIL: loop returned '$got'" >&2; exit 1; }
+loop_ms="$(printf '%s' "$got" | awk '{print $2}')"
+[ "$loop_ms" -ge 450 ] && [ "$loop_ms" -le 1500 ] || { echo "FAIL: loop ended after $loop_ms ms" >&2; exit 1; }
+[ "$health_ms" -le 1500 ] || { echo "FAIL: /health waited $health_ms ms during the loop" >&2; exit 1; }
+echo "ok: loop -> $got; /health answered after $health_ms ms during it"
+expect_log limit "executor: Worker loader Worker exceeded its CPU slice limit"
+expect_match "http://127.0.0.1:$L/?name=a" '^200 [0-9]+ 1$'
+expect_match "http://127.0.0.1:$L/?name=b" '^200 [0-9]+ 2$'
+expect_match "http://127.0.0.1:$L/health" '^ok$'
+# A WebAssembly loop ends the same way.
+expect_ms_between "http://127.0.0.1:$L/?name=w&mode=wasm" 450 1500 "$CPU_ERROR"
+expect_match "http://127.0.0.1:$L/?name=w" '^200 [0-9]+ 1$'
+# A loop at the top level fails the load; the name's next load compiles afresh.
+expect_ms_between "http://127.0.0.1:$L/?name=top" 450 1500 "$CPU_ERROR"
+expect_match "http://127.0.0.1:$L/?name=top" '^200 [0-9]+ 1$'
+# Under the limit, waiting longer than it, and the config Worker: never limited.
+expect_match "http://127.0.0.1:$L/?name=c&mode=busy&n=$(( per_ms * 150 ))" '^200 [0-9]+ 1$'
+expect_ms_between "http://127.0.0.1:$L/?name=c&mode=wait&ms=2000" 1900 4000 '^200 [0-9]+ 2$'
+expect_match "http://127.0.0.1:$L/static-busy?n=$(( per_ms * 1500 ))" '^static ok$'
+if grep -q "exceeded its CPU slice limit.*\"parent\"" "$DIR/limit.log"; then
+  cat "$DIR/limit.log"; echo "FAIL: the config Worker was limited" >&2; exit 1
+fi
+
 echo "smoke test passed"

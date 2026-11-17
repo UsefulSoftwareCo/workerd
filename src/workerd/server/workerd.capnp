@@ -101,6 +101,26 @@ struct Config {
   memory @8 :MemoryOptions;
   # Executor fork: process-level memory management. Every option defaults to upstream behavior,
   # so leaving this unset changes nothing.
+
+  dynamicWorkerLimits @9 :DynamicWorkerLimits;
+  # Executor fork: limits on Workers loaded through a Worker loader binding. Every option defaults
+  # to upstream behavior (no limit), so leaving this unset changes nothing.
+}
+
+struct DynamicWorkerLimits {
+  # Executor fork. An optional CPU budget for continuous JavaScript execution in Workers created
+  # through a Worker loader. Workers defined in this config retain their existing behavior.
+
+  sliceCpuMs @0 :UInt32 = 0;
+  # When non-zero, each continuous stretch ("slice") of JavaScript that a Worker loaded through a
+  # Worker loader runs may use this many milliseconds of CPU time: one entry into JavaScript for a
+  # request or event (with the microtasks it queues), one top-level module evaluation, or one
+  # dynamic import. Time spent awaiting I/O, timers or RPC is not part of any slice. A slice that
+  # reaches the limit is terminated, its request fails with "Worker exceeded CPU time limit." (the
+  # request's outcome is exceededCpu), and the Worker's isolate is unloaded, so the next load() or
+  # get() of its name starts a fresh one; other requests in flight in that isolate run on in it.
+  # A single long native call (a large sort, JSON.parse or structuredClone) cannot be interrupted
+  # and ends the slice when it returns. 0 keeps upstream behavior.
 }
 
 struct MemoryOptions {

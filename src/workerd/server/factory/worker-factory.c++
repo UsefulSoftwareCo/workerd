@@ -104,6 +104,14 @@ WorkerFactory::Impl::Impl(WorkerFactory& factory,
   } else {
     logging.structuredLogging = StructuredLogging(root.getStructuredLogging());
   }
+
+  // Executor fork: the slice limit of Worker loader Workers.
+  if (root.hasDynamicWorkerLimits()) {
+    auto sliceCpuMs = root.getDynamicWorkerLimits().getSliceCpuMs();
+    if (sliceCpuMs > 0) {
+      sliceWatchdog = kj::arc<const SliceWatchdog>(sliceCpuMs * kj::MILLISECONDS);
+    }
+  }
 }
 
 const ServerHandle& WorkerFactory::Impl::getServer() const {
@@ -1146,8 +1154,16 @@ kj::Own<WorkerInterface> createEntrypoint(CompiledWorker::Impl& worker,
   }
 
   auto ioChannelFactory = kj::rc<RustIoChannelFactory>(kj::addRef(worker), kj::mv(channels));
+  kj::Own<LimitEnforcer> limitEnforcer = kj::refcounted<NullLimitEnforcer>();
+  // Executor fork: a Worker loader's Workers run under the slice limit, if one is set.
+  KJ_IF_SOME(watchdog, worker.factory.getImpl().sliceWatchdog) {
+    if (worker.isDynamic) {
+      limitEnforcer =
+          newSliceLimitEnforcer(watchdog.addRef(), kj::mv(limitEnforcer), kj::str(worker.name));
+    }
+  }
   return newWorkerEntrypoint(threadContext, kj::atomicAddRef(worker.getWorker()),
-      entrypointName.clone(), kj::mv(props), kj::mv(actor), kj::refcounted<NullLimitEnforcer>(), {},
+      entrypointName.clone(), kj::mv(props), kj::mv(actor), kj::mv(limitEnforcer), {},
       kj::mv(ioChannelFactory), kj::mv(observer), worker.waitUntilTasks, true, kj::mv(workerTracer),
       kj::mv(metadata.cfBlobJson), kj::none, kj::mv(triggerContext), IsDynamicDispatch::NO,
       kj::mv(accessInfo), kj::mv(metadata.restoredSelfTokenFactory), metadata.fromPersistentStub,
@@ -1698,10 +1714,23 @@ kj::Promise<kj::Own<CompiledWorker>> compileWorker(const WorkerFactory& constFac
     }
   }
 
+  // Executor fork: set when the Worker's isolate runs under the slice limit.
+  kj::Maybe<const SliceLimitedIsolateLimitEnforcer&> sliceLimitedIsolate;
+
   // The isolate of the Worker, or of the zygote that snapshots its startup.
   auto makeIsolate = [&](kj::StringPtr isolateName, Worker::Isolate::InspectorPolicy policy,
                          kj::Maybe<jsg::SnapshotConfig> snapshotConfig) {
-    auto limitEnforcer = kj::refcounted<NullIsolateLimitEnforcer>();
+    kj::Own<IsolateLimitEnforcer> limitEnforcer = kj::refcounted<NullIsolateLimitEnforcer>();
+    // Executor fork: a Worker loader's Workers evaluate their modules under the slice limit, if
+    // one is set. (Their isolates never snapshot their startup: a dynamic Worker never qualifies.)
+    KJ_IF_SOME(watchdog, factory.sliceWatchdog) {
+      if (impl->isDynamic) {
+        auto limited = kj::refcounted<SliceLimitedIsolateLimitEnforcer>(
+            watchdog.addRef(), kj::mv(limitEnforcer));
+        sliceLimitedIsolate = *limited;
+        limitEnforcer = kj::mv(limited);
+      }
+    }
     auto listeners = KJ_MAP(listener, spec.inbound_listeners) {
       return Worker::Api::InboundListener{
         .protocol = kj::str(listener.protocol),
@@ -1880,6 +1909,9 @@ kj::Promise<kj::Own<CompiledWorker>> compileWorker(const WorkerFactory& constFac
               impl->subrequestChannels.size() - IoContext::SPECIAL_SUBREQUEST_CHANNEL_COUNT)
         : 0,
     .env_actor_classes = static_cast<uint32_t>(impl->actorClassChannels.size()),
+    .startup_exceeded_cpu = sliceLimitedIsolate.map([](const SliceLimitedIsolateLimitEnforcer& e) {
+    return e.startupLimitExceeded();
+  }).orDefault(false),
   };
   impl->worker = kj::mv(worker);
   co_return kj::heap<CompiledWorker>(kj::mv(impl));

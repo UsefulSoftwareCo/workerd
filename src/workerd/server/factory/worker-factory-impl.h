@@ -7,6 +7,7 @@
 // The private state behind worker-factory.h, shared by the factory's source files.
 
 #include "memory-maintenance.h"
+#include "slice-limit.h"
 #include "worker-factory.h"
 
 #include <workerd/api/bench.h>
@@ -140,6 +141,10 @@ class WorkerFactory::Impl final: private kj::TaskSet::ErrorHandler {
   // `Config.memory`. Null when no memory option is enabled. Declared after `tasks` so that it is
   // destroyed first; it only holds weak references to isolates.
   kj::Maybe<kj::Own<MemoryMaintenance>> memoryMaintenance;
+
+  // Executor fork: the watchdog of Worker loader Workers' slice limit
+  // (`Config.dynamicWorkerLimits.sliceCpuMs`); null when no limit is set.
+  kj::Maybe<kj::Arc<const SliceWatchdog>> sliceWatchdog;
 
   const ServerHandle& getServer() const;
 

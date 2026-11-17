@@ -300,6 +300,16 @@ impl WorkerService {
 
         let info = ffi::worker_info(&compiled);
         if !info.errors.is_empty() {
+            // Executor fork: a worker whose top level exceeded the slice limit leaves its loader,
+            // so that the next load of its name starts afresh rather than failing the same way.
+            if info.startup_exceeded_cpu {
+                tracing::warn!(
+                    worker = %spec.name,
+                    "executor: Worker loader Worker exceeded its CPU slice limit at startup; \
+                     unloading it"
+                );
+                abort_isolate();
+            }
             return Err(kj::failed!(
                 "jsg.Error: Failed to start Worker:\n{}",
                 info.errors.join("\n")

@@ -16,6 +16,7 @@ behaves like upstream; the smoke test checks that the default config logs no mem
 | Return free TCMalloc memory to the OS | `tcmallocBackgroundReleaseBytesPerSecond`, `releaseMemoryAfterGc` | workerd never runs TCMalloc's background actions, so freed memory stays in TCMalloc's page heap. |
 | Unload idle named Worker loader isolates, Keep Worker loader entries loaded while waitUntil work or actors run | `workerLoaderIdleTtlMs` | Named Worker loader isolates are kept until `abortIsolate()`, although the binding documents unloading unused Workers. |
 | Allow reloading an unloaded Worker loader name with the inspector on | (always on) | With `--inspector-addr`, loading a name again after it was unloaded failed with "inserted row already exists in table". |
+| Limit each slice of a Worker loader Worker's JavaScript | `Config.dynamicWorkerLimits.sliceCpuMs` | An optional CPU budget for continuous JavaScript execution in Workers created through a Worker loader. Config-defined Workers retain their existing behavior. |
 
 ### Where the patches live
 
@@ -34,6 +35,29 @@ in `src/workerd/server/factory/`), the patches are split along that boundary:
 - `factory/worker-factory-rpc.c++` (`InspectorService::registerIsolate`): the inspector fix.
   Inspector-enabled reload support is for development use. Keep the inspector disabled in
   production; Executor's image does not pass `--inspector-addr`.
+- `factory/slice-limit.{h,c++}`: the slice limit. `createEntrypoint` wraps the request's
+  `NullLimitEnforcer`, and `makeIsolate` the isolate's `NullIsolateLimitEnforcer`, for a Worker
+  loader's Workers only (`CompiledWorker::Impl::isDynamic`); `server/worker.rs` unloads a
+  Worker whose top level exceeded the limit (`WorkerInfo.startup_exceeded_cpu`).
+
+### Notes on the slice limit
+
+- A slice is one entry into JavaScript for a request or event (`IoContext::runImpl()`, with the
+  microtasks it runs), one top-level module evaluation (`enterStartupJs()`) or one dynamic import
+  (`enterDynamicImportJs()`). Awaiting I/O, timers or RPC is outside every slice. Python startup,
+  inspector commands and the memory maintenance loop's task pumping are not limited. The CPU
+  budget applies only at these execution boundaries; it is not a process-wide responsiveness
+  guarantee.
+- The limit is on the CPU time of the thread that runs the slice. One watchdog thread checks the
+  slices in progress every tenth of the limit (1 ms to 100 ms) and terminates a slice's JavaScript
+  with `v8::Isolate::TerminateExecution()` once it has used the limit.
+- The request then fails with the JavaScript error "Worker exceeded CPU time limit." and the
+  outcome `exceededCpu`, and the Worker's isolate is aborted (`abortIsolate()`), so a named
+  Worker's next `load()` or `get()` starts a fresh isolate. Other requests in flight in that isolate
+  carry on in it until they end. A breach at the top level fails the load, and the name is unloaded
+  the same way.
+- A single native call that does not check for termination (a large sort, `JSON.parse` or
+  `structuredClone`) ends the slice only when it returns.
 
 ### Notes on the memory patches
 
