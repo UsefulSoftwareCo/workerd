@@ -25,7 +25,8 @@ in `src/workerd/server/factory/`), the patches are split along that boundary:
 - `factory/memory-maintenance.{h,c++}`: the idle-isolate and memory-pressure collections and the
   TCMalloc release. The worker factory registers each isolate it creates with it, and
   `server/run.rs` starts it (`factory_start_memory_maintenance`) for `workerd serve`, before any
-  isolate exists; `workerd test` and `workerd bench` run without it.
+  isolate exists; `workerd test` and `workerd bench` run without it. The server stops it
+  (`factory_stop_memory_maintenance`) first when it shuts down, before actors and workers go.
 - `server/loader.rs` (`start_idle_eviction`, `WorkerLoaderNamespace::evict_idle`): idle Worker
   loader unloading, a server task that runs every `maintenanceIntervalMs`. A loaded Worker counts
   as used while its `Rc<WorkerStub>` has another owner, or while `worker_has_pending_work` reports

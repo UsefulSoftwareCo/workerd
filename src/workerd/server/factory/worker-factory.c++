@@ -1968,6 +1968,10 @@ void factory_start_memory_maintenance(const WorkerFactory& constFactory) {
   }
 }
 
+void factory_stop_memory_maintenance(const WorkerFactory& factory) {
+  factory.getImpl().memoryMaintenance = kj::none;
+}
+
 WorkerInfo worker_info(const CompiledWorker& worker) {
   return worker.getImpl().info;
 }

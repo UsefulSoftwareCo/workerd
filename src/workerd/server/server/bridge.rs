@@ -713,6 +713,11 @@ pub mod ffi {
         /// Every isolate the factory creates afterwards is watched.
         fn factory_start_memory_maintenance(factory: &WorkerFactory);
 
+        /// Executor fork: stops the memory maintenance, cancelling any collection or task pump it
+        /// has in progress. The server calls this first when it shuts down, before its actors and
+        /// workers are torn down.
+        fn factory_stop_memory_maintenance(factory: &WorkerFactory);
+
         // The listeners' shims (worker-factory-listen.c++).
 
         /// A copy of `headers` with `edits` and then `injected` applied in order.

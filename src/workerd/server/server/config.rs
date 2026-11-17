@@ -635,6 +635,9 @@ impl Server {
 
 impl Drop for Server {
     fn drop(&mut self) {
+        // Executor fork: stop memory maintenance first, so that it does not touch isolates while
+        // they are being torn down.
+        ffi::factory_stop_memory_maintenance(self.factory.raw());
         // Actors may have background work, which aborting them cancels. The run's background
         // tasks (tasks.rs) go too: one may hold an actor, and so its class's worker.
         self.abort_all_actors(Some(&kj::disconnected!("Server shutting down.")));
