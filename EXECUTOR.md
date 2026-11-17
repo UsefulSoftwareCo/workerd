@@ -100,3 +100,25 @@ from that artifact with `gh release create`, or use the `from_run` input once pu
 
 The build uses standard GitHub-hosted runners and the Actions cache for Bazel's disk cache; there
 is no remote cache. A cold build takes about two hours.
+
+### Other workflows
+
+Every workflow in this repository other than `executor-release.yml` comes from upstream and is
+disabled on purpose in the repository's Actions settings, since 17 November 2026. They are
+upstream's own development workflows (tests, lint, daily releases, bots), and this fork uses only
+the release workflow. Their files are left unchanged so that upstream updates apply cleanly. To
+run one, enable it in the Actions tab or with
+`gh workflow enable <file> --repo UsefulSoftwareCo/workerd`.
+
+The workflows disabled that day: `_bazel.yml`, `_wpt.yml`, `bigbonk.yml`, `bonk.yml`, `cla.yml`,
+`codspeed.yml`, `compat-flag-docs.yml`, `coverage.yml`, `daily-release.yml`, `deps-updater.yml`,
+`experimental-workflow.yml`, `fixup.yml`, `internal-build.yml`, `issues.yml`, `labels.yml`,
+`lint.yml`, `new-pr-review.yml`, `release-python-runtime.yml`, `release-python-snapshots.yml`,
+`release.yml`, `semgrep.yml`, `test.yml`, `update-wpt.yml` and `wpt-report.yml`. Three of them
+(`bigbonk.yml`, `bonk.yml`, `new-pr-review.yml`) are not in this branch; GitHub lists them from
+other branches. A workflow that upstream adds later is not covered and may start enabled, so
+check the Actions tab after moving to a new upstream version.
+
+A push that changes only this file does not start a release build. On 17 November 2026 a manual
+run was refused with "Actions has been disabled for this repository"; Actions had to be re-enabled
+for the fork before runs started.
