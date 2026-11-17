@@ -596,6 +596,19 @@ impl Server {
             .filter_map(|(name, service)| Some((name.as_str(), service.as_worker()?)))
     }
 
+    /// Executor fork: unloads the named dynamic workers of every loader namespace that nothing has
+    /// used for `ttl` (`WorkerLoaderNamespace::evict_idle`). Returns how many were unloaded.
+    pub fn evict_idle_worker_loaders(&self, now: Duration, ttl: Duration) -> usize {
+        let loaders: Vec<Rc<WorkerLoaderNamespace>> = {
+            let loaders = self.worker_loaders.borrow();
+            loaders.by_id.values().chain(&loaders.anonymous).cloned().collect()
+        };
+        loaders
+            .iter()
+            .map(|loader| loader.evict_idle(now, ttl))
+            .sum()
+    }
+
     /// Aborts every evictable actor. `reason` becomes the error of the actors' in-flight requests.
     pub fn abort_all_actors(&self, reason: Option<&crate::Error>) {
         for (_, worker) in self.workers() {

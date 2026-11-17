@@ -15,6 +15,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::rc::Weak;
+use std::time::Duration;
 
 use futures::FutureExt;
 use futures::future::LocalBoxFuture;
@@ -22,6 +23,7 @@ use futures::future::Shared;
 use kj_rs::KjMaybe;
 use kj_rs::KjOwn;
 use worker::Interface;
+use workerd_capnp::config;
 
 use crate::Result;
 use crate::bridge::ffi;
@@ -39,6 +41,7 @@ use crate::channels::WorkerInterface;
 use crate::channels::attach;
 use crate::config::Factory;
 use crate::config::Server;
+use crate::config::capnp_error;
 use crate::worker::WorkerService;
 
 /// One `workerLoader` namespace. Bindings with the same `id` share a namespace, so a worker
@@ -120,6 +123,39 @@ impl WorkerLoaderNamespace {
         Ok(stub)
     }
 
+    /// Executor fork: unloads named workers that nothing has referenced for `ttl`. The map holds
+    /// one reference to each stub; callers' stubs, in-flight requests, and entrypoint and actor
+    /// class channels each hold another. So an entry that is not shared is unused, and dropping it
+    /// tears the isolate down the same way `abortIsolate()` does. Stubs that have not finished
+    /// starting are left alone. Returns the number of workers unloaded.
+    pub fn evict_idle(&self, now: Duration, ttl: Duration) -> usize {
+        let expired: Vec<Rc<WorkerStub>> = {
+            let mut isolates = self.isolates.borrow_mut();
+            let mut names = Vec::new();
+            for (name, stub) in isolates.iter() {
+                if Rc::strong_count(stub) > 1 || !stub.is_started() {
+                    stub.idle_since.set(None);
+                    continue;
+                }
+                match stub.idle_since.get() {
+                    Some(since) => {
+                        if now.saturating_sub(since) >= ttl {
+                            names.push(name.clone());
+                        }
+                    }
+                    None => stub.idle_since.set(Some(now)),
+                }
+            }
+            names
+                .iter()
+                .filter_map(|name| isolates.remove(name))
+                .collect()
+        };
+        // Dropped once the map is no longer borrowed; each stub's drop unlinks its worker on the
+        // next turn of the event loop.
+        expired.len()
+    }
+
     /// Drops every loaded worker's links, as the server does its own at teardown.
     pub fn unlink(&self) {
         for stub in self.isolates.borrow().values() {
@@ -134,6 +170,8 @@ pub struct WorkerStub {
     /// result stays readable here (`Shared::peek`).
     startup: Shared<LocalBoxFuture<'static, Result<Rc<WorkerService>>>>,
     unlinked: Cell<bool>,
+    /// Executor fork: when `evict_idle` first found the stub unused; reset whenever it is in use.
+    idle_since: Cell<Option<Duration>>,
 }
 
 impl WorkerStub {
@@ -163,7 +201,13 @@ impl WorkerStub {
         Rc::new(Self {
             startup,
             unlinked: Cell::new(false),
+            idle_since: Cell::new(None),
         })
+    }
+
+    /// Executor fork: whether startup has finished with a started worker.
+    fn is_started(&self) -> bool {
+        matches!(self.startup.peek(), Some(Ok(_)))
     }
 
     /// Resolves once the worker has started; fails with the startup error.
@@ -230,6 +274,39 @@ impl crate::channels::WorkerStub {
             props,
         }))
     }
+}
+
+/// Executor fork: with `Config.memory.workerLoaderIdleTtlMs` set, unloads the named dynamic
+/// workers nothing has used for that long, checking every `maintenanceIntervalMs`, for as long as
+/// `server` lives.
+pub fn start_idle_eviction(server: &Rc<Server>, config: config::Reader<'_>) -> Result<()> {
+    if !config.has_memory() {
+        return Ok(());
+    }
+    let memory = config.get_memory().map_err(capnp_error)?;
+    if memory.get_worker_loader_idle_ttl_ms() == 0 {
+        return Ok(());
+    }
+    let ttl = Duration::from_millis(u64::from(memory.get_worker_loader_idle_ttl_ms()));
+    let interval = Duration::from_millis(u64::from(memory.get_maintenance_interval_ms().max(10)));
+    let factory = Rc::clone(server.factory());
+    let server = Rc::downgrade(server);
+    factory.spawn_detached({
+        let factory = Rc::clone(&factory);
+        async move {
+            loop {
+                factory.sleep(interval).await;
+                let Some(server) = server.upgrade() else {
+                    return;
+                };
+                let evicted = server.evict_idle_worker_loaders(factory.now(), ttl);
+                if evicted > 0 {
+                    tracing::info!(evicted, "executor: unloaded idle Worker loader isolates");
+                }
+            }
+        }
+    });
+    Ok(())
 }
 
 pub(crate) fn dynamic_transfer_error() -> crate::Error {

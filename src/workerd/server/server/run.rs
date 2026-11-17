@@ -187,6 +187,11 @@ async fn start(
     )
     .await?;
     report_unmatched_overrides(&server, &options.overrides, config, for_test)?;
+    // Executor fork: idle Worker loader unloading (`Config.memory.workerLoaderIdleTtlMs`), for
+    // `workerd serve` only, like the rest of the memory maintenance.
+    if !for_test {
+        crate::loader::start_idle_eviction(&server, config)?;
+    }
 
     let (drain, draining) = watch::channel(false);
     let context = Rc::new(ListenContext {
