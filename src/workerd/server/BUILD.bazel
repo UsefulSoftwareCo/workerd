@@ -38,6 +38,8 @@ selects.config_setting_group(
         ":set_use_tcmalloc",
         "//:is_linux",
     ],
+    # Executor fork: factory/ selects on it for the TCMalloc extension API.
+    visibility = ["//src/workerd/server:__subpackages__"],
 )
 
 # current malloc in use

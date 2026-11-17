@@ -1960,6 +1960,7 @@ void factory_start_memory_maintenance(const WorkerFactory& constFactory) {
   auto& factory = constFactory.getImpl();
   auto config = factory.config;
   if (factory.memoryMaintenance != kj::none || !config.hasMemory()) return;
+  startTcmallocBackgroundRelease(config.getMemory().getTcmallocBackgroundReleaseBytesPerSecond());
   if (MemoryMaintenance::isEnabled(config.getMemory())) {
     auto mm = kj::heap<MemoryMaintenance>(factory.timer, config.getMemory());
     mm->start();

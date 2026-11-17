@@ -14,6 +14,12 @@
 
 namespace workerd::server {
 
+// Starts TCMalloc's background actions thread with the given release rate. Upstream workerd never
+// calls MallocExtension::ProcessBackgroundActions(), so TCMalloc's background release rate has no
+// effect and free pages stay cached in the page heap for the life of the process. Does nothing
+// when `bytesPerSecond` is 0, and warns in builds without TCMalloc.
+void startTcmallocBackgroundRelease(uint64_t bytesPerSecond);
+
 // Watches isolates for idleness and collects their garbage; see memory-maintenance.c++.
 class MemoryMaintenance final: private kj::TaskSet::ErrorHandler {
  public:
@@ -39,7 +45,11 @@ class MemoryMaintenance final: private kj::TaskSet::ErrorHandler {
   kj::Duration idleTaskPump;
   uint64_t pressureThresholdBytes;
   kj::Duration pressureCooldown;
+  bool releaseMemoryAfterGc;
   kj::TimePoint nextPressureCollection;
+
+  // Set when a collection finished since the last time free malloc memory was released.
+  bool releasePending = false;
 
   kj::Vector<kj::Rc<IsolateEntry>> isolates;
   kj::TaskSet pumpTasks;

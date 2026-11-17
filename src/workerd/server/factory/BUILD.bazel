@@ -37,6 +37,12 @@ wd_cc_library(
         "memory-maintenance.h",
     ],
     linkstatic = CC_LIBRARY_LINKSTATIC,
+    # Executor fork: memory-maintenance.c++ configures TCMalloc through its extension API when it
+    # is in use.
+    local_defines = select({
+        "//src/workerd/server:really_use_tcmalloc": ["WD_EXECUTOR_TCMALLOC"],
+        "//conditions:default": [],
+    }),
     deps = [
         ":worker-factory-hdrs",
         "//src/rust/worker:bridge",
@@ -66,7 +72,10 @@ wd_cc_library(
         "@capnp-cpp//src/kj:kj-async-io",
         "@capnp-cpp//src/kj/compat:kj-http",
         "@ssl",
-    ],
+    ] + select({
+        "//src/workerd/server:really_use_tcmalloc": ["@tcmalloc//tcmalloc:malloc_extension"],
+        "//conditions:default": [],
+    }),
 )
 
 # The declarations both bridges (the command line's and the server's) need from :bootstrap.

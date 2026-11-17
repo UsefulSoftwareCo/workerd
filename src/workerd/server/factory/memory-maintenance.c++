@@ -38,6 +38,10 @@
 #include <cstring>
 #endif
 
+#if WD_EXECUTOR_TCMALLOC
+#include "tcmalloc/malloc_extension.h"
+#endif
+
 namespace workerd::server {
 
 struct MemoryMaintenance::IsolateEntry final: public kj::Refcounted {
@@ -66,6 +70,13 @@ struct MemoryMaintenance::IsolateEntry final: public kj::Refcounted {
 };
 
 namespace {
+
+// Returns all free memory cached in TCMalloc's page heap to the OS. No-op without TCMalloc.
+void releaseFreeMallocMemory() {
+#if WD_EXECUTOR_TCMALLOC
+  tcmalloc::MallocExtension::ReleaseMemoryToSystem(kj::maxValue);
+#endif
+}
 
 // Runs the isolate's pending V8 foreground tasks, the same way IoContext does at the end of a
 // request: without an IoContext, running microtasks queued by FinalizationRegistry callbacks.
@@ -122,6 +133,28 @@ kj::Maybe<uint64_t> readMemoryUsage() {
 
 }  // namespace
 
+void startTcmallocBackgroundRelease(uint64_t bytesPerSecond) {
+  if (bytesPerSecond == 0) return;
+#if WD_EXECUTOR_TCMALLOC
+  static bool started = false;
+  if (started) return;
+  if (!tcmalloc::MallocExtension::NeedsProcessBackgroundActions()) {
+    KJ_LOG(WARNING, "executor: TCMalloc does not need background actions here; not starting them");
+    return;
+  }
+  started = true;
+  tcmalloc::MallocExtension::SetBackgroundReleaseRate(
+      static_cast<tcmalloc::MallocExtension::BytesPerSecond>(bytesPerSecond));
+  kj::Thread thread([]() { tcmalloc::MallocExtension::ProcessBackgroundActions(); });
+  thread.detach();
+  KJ_LOG(INFO, "executor: TCMalloc background release enabled", bytesPerSecond);
+#else
+  KJ_LOG(WARNING,
+      "executor: memory.tcmallocBackgroundReleaseBytesPerSecond is set but this build does not use "
+      "TCMalloc; ignoring it");
+#endif
+}
+
 MemoryMaintenance::MemoryMaintenance(kj::Timer& timer, config::MemoryOptions::Reader conf)
     : timer(timer),
       interval(kj::max(conf.getMaintenanceIntervalMs(), 10u) * kj::MILLISECONDS),
@@ -130,6 +163,7 @@ MemoryMaintenance::MemoryMaintenance(kj::Timer& timer, config::MemoryOptions::Re
       idleTaskPump(conf.getIdleTaskPumpMs() * kj::MILLISECONDS),
       pressureThresholdBytes(conf.getPressureThresholdMb() * 1024 * 1024),
       pressureCooldown(conf.getPressureCooldownMs() * kj::MILLISECONDS),
+      releaseMemoryAfterGc(conf.getReleaseMemoryAfterGc()),
       nextPressureCollection(timer.now()),
       pumpTasks(*this) {}
 
@@ -196,6 +230,15 @@ kj::Promise<void> MemoryMaintenance::sweep() {
       }
     }
   }
+
+  // Collections free V8 heap pages directly, but native objects owned by collected JavaScript
+  // objects go back to TCMalloc, which keeps them cached. Hand that memory back to the OS
+  // once per sweep at most.
+  if (releasePending && releaseMemoryAfterGc) {
+    releaseFreeMallocMemory();
+    KJ_LOG(INFO, "executor: released free malloc memory to the OS");
+  }
+  releasePending = false;
 }
 
 kj::Promise<void> MemoryMaintenance::collectIdle(kj::Rc<IsolateEntry> entry) {
@@ -227,6 +270,7 @@ kj::Promise<void> MemoryMaintenance::collectIdle(kj::Rc<IsolateEntry> entry) {
     entry->lastLockCount = isolate->getLockSuccessCount();
   }
   entry->collected = true;
+  releasePending = true;
   KJ_LOG(INFO, "executor: collected idle isolate", entry->name, full ? "full" : "moderate");
 
   if (idleTaskPump > 0 * kj::MILLISECONDS && !entry->pumping) {
@@ -242,7 +286,11 @@ kj::Promise<void> MemoryMaintenance::collectIdle(kj::Rc<IsolateEntry> entry) {
 // maintenance interval.
 kj::Promise<void> MemoryMaintenance::pumpWhileIdle(
     kj::Rc<IsolateEntry> entry, kj::TimePoint until) {
-  KJ_DEFER(entry->pumping = false);
+  KJ_DEFER({
+    entry->pumping = false;
+    // Tasks run during the pumping can free memory too, so release afterwards as well.
+    releasePending = true;
+  });
   auto burstEnd = timer.now() + 2 * kj::SECONDS;
   while (timer.now() < until) {
     co_await timer.afterDelay(timer.now() < burstEnd ? 20 * kj::MILLISECONDS : interval);
@@ -280,6 +328,7 @@ kj::Promise<void> MemoryMaintenance::collectAll(uint64_t usage) {
       pumpForegroundTasks(js);
     });
     entry->lastLockCount = isolate->getLockSuccessCount();
+    releasePending = true;
     if (!wasIdle) {
       entry->lastActive = timer.now();
       entry->collected = false;
