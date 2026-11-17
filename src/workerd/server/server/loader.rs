@@ -123,17 +123,19 @@ impl WorkerLoaderNamespace {
         Ok(stub)
     }
 
-    /// Executor fork: unloads named workers that nothing has referenced for `ttl`. The map holds
-    /// one reference to each stub; callers' stubs, in-flight requests, and entrypoint and actor
-    /// class channels each hold another. So an entry that is not shared is unused, and dropping it
-    /// tears the isolate down the same way `abortIsolate()` does. Stubs that have not finished
-    /// starting are left alone. Returns the number of workers unloaded.
+    /// Executor fork: unloads named workers that have been unused for `ttl`. The map holds one
+    /// reference to each stub; callers' stubs, in-flight requests, and entrypoint and actor class
+    /// channels each hold another. A request's reference ends with its response, though, while
+    /// `ctx.waitUntil()` work and actors keep running in the worker, so an entry also counts as
+    /// used while its worker has any of those (`WorkerService::has_pending_work`). Dropping an
+    /// unused entry tears the isolate down the same way `abortIsolate()` does. Stubs that have not
+    /// finished starting are left alone. Returns the number of workers unloaded.
     pub fn evict_idle(&self, now: Duration, ttl: Duration) -> usize {
         let expired: Vec<Rc<WorkerStub>> = {
             let mut isolates = self.isolates.borrow_mut();
             let mut names = Vec::new();
             for (name, stub) in isolates.iter() {
-                if Rc::strong_count(stub) > 1 || !stub.is_started() {
+                if Rc::strong_count(stub) > 1 || !stub.is_idle() {
                     stub.idle_since.set(None);
                     continue;
                 }
@@ -205,9 +207,10 @@ impl WorkerStub {
         })
     }
 
-    /// Executor fork: whether startup has finished with a started worker.
-    fn is_started(&self) -> bool {
-        matches!(self.startup.peek(), Some(Ok(_)))
+    /// Executor fork: whether the worker has started and has no request, `ctx.waitUntil()` work
+    /// or actor in progress.
+    fn is_idle(&self) -> bool {
+        matches!(self.startup.peek(), Some(Ok(service)) if !service.has_pending_work())
     }
 
     /// Resolves once the worker has started; fails with the startup error.

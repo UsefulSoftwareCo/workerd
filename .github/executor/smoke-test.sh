@@ -140,6 +140,20 @@ expect_log loader "executor: unloaded idle Worker loader isolates"
 expect "http://127.0.0.1:18084/?name=a" 1
 expect "http://127.0.0.1:18084/?name=a" 2
 
+# Pending ctx.waitUntil() work keeps a named Worker loaded past the TTL. The work takes 3 s, longer
+# than the 2 s TTL, and runs to completion in the same isolate; the entry is unloaded only once the
+# work has finished and the TTL has passed again.
+write_config waituntil 18086 "memory = (maintenanceIntervalMs = 100, workerLoaderIdleTtlMs = 2000),"
+start waituntil 18086
+expect "http://127.0.0.1:18086/?name=a" 1
+expect "http://127.0.0.1:18086/?name=a&mode=bg" 2
+sleep 3
+expect_log waituntil "child waitUntil done"
+expect "http://127.0.0.1:18086/?name=a&mode=state" "3 bg=1"
+sleep 3
+expect_log waituntil "executor: unloaded idle Worker loader isolates"
+expect "http://127.0.0.1:18086/?name=a" 1
+
 # The same with the inspector enabled: loading a name again after it was unloaded must work.
 write_config inspector 18085 "memory = (maintenanceIntervalMs = 100, workerLoaderIdleTtlMs = 500),"
 INSPECTOR=19229 start inspector 18085

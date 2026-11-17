@@ -220,6 +220,7 @@ bool factory_assets_navigation_prefers_asset_serving(
 WorkerInfo worker_info(const CompiledWorker& worker);
 void worker_set_ctx_exports(const CompiledWorker& worker, ::rust::Slice<const uint64_t> globals);
 void worker_unlink(const CompiledWorker& worker);
+bool worker_has_pending_work(const CompiledWorker& worker);
 kj::Own<WorkerInterface> worker_start_request(const CompiledWorker& worker,
     kj::Maybe<::rust::Str> entrypoint,
     kj::Maybe<kj::Own<Frankenvalue>> props,

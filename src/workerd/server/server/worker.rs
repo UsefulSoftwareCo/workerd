@@ -756,6 +756,13 @@ impl WorkerService {
         drop((namespaces, channels));
     }
 
+    /// Executor fork: whether the worker still has a request, `ctx.waitUntil()` work or an actor
+    /// in progress; see `ffi::worker_has_pending_work`.
+    #[must_use]
+    pub fn has_pending_work(&self) -> bool {
+        ffi::worker_has_pending_work(&self.worker)
+    }
+
     /// Makes every request and actor construction fail because the config is invalid.
     pub fn set_broken(&self) {
         self.broken.set(true);

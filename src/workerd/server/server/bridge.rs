@@ -401,6 +401,11 @@ pub mod ffi {
         /// channels; and drops a dynamic worker's env channel tables and tails, which may refer
         /// back to the worker that loaded it. Called when the server unlinks the worker.
         fn worker_unlink(worker: &CompiledWorker);
+        /// Executor fork: whether the worker still has work in progress: a request, an
+        /// `IoContext` that outlives its request (`ctx.waitUntil()`), or an actor. Each of those
+        /// holds a reference to the `Worker`, and a request's drain task sits in its
+        /// `waitUntil` task set. Unlinking now would cancel that work.
+        fn worker_has_pending_work(worker: &CompiledWorker) -> bool;
         /// Starts a request on the worker. `channels` is the worker's I/O channel table for this
         /// request; `tails` receive the request's trace once it completes (the server passes none
         /// for a request that is itself a tail worker's, so that tails do not trace themselves,

@@ -1987,6 +1987,14 @@ void worker_set_ctx_exports(const CompiledWorker& worker, ::rust::Slice<const ui
   });
 }
 
+bool worker_has_pending_work(const CompiledWorker& worker) {
+  auto& impl = worker.getImpl();
+  KJ_IF_SOME(w, impl.worker) {
+    if (w->isShared()) return true;
+  }
+  return !impl.waitUntilTasks.isEmpty();
+}
+
 void worker_unlink(const CompiledWorker& worker) {
   auto& impl = worker.getImpl();
   impl.waitUntilTasks.clear();
