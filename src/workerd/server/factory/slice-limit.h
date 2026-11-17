@@ -15,6 +15,8 @@
 #include <kj/thread.h>
 #include <kj/time.h>
 
+#include <utility>
+
 namespace workerd::server {
 
 // The thread that watches the slices in progress. Each slice measures the CPU time of the thread
@@ -81,6 +83,12 @@ class SliceLimitedIsolateLimitEnforcer final: public IsolateLimitEnforcer {
     return startupExceeded;
   }
 
+  // True, once, after a dynamic import exceeded the limit. A dynamic import runs under its own lock
+  // outside the request's slices, so the request's enforcer asks after each of its slices.
+  bool takeDynamicImportBreach() const {
+    return std::exchange(dynamicImportExceeded, false);
+  }
+
   v8::Isolate::CreateParams getCreateParams() override {
     return inner->getCreateParams();
   }
@@ -136,10 +144,12 @@ class SliceLimitedIsolateLimitEnforcer final: public IsolateLimitEnforcer {
   kj::Arc<const SliceWatchdog> watchdog;
   kj::Own<IsolateLimitEnforcer> inner;
   mutable bool startupExceeded = false;
+  mutable bool dynamicImportExceeded = false;
 
   kj::Own<void> enterLimited(jsg::Lock& lock,
       kj::OneOf<kj::Exception, kj::Duration>& limitErrorOrTime,
-      kj::Own<void> innerScope) const;
+      kj::Own<void> innerScope,
+      bool dynamicImport) const;
 };
 
 }  // namespace workerd::server

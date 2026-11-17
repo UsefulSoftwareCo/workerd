@@ -980,7 +980,19 @@ struct Worker::Script::Impl {
           } catch (jsg::JsExceptionThrown&) {
             // Handled below...
           } catch (kj::Exception& ex) {
+            // Executor fork: when a limit ended the import, report the limit, not the exception
+            // the termination of its JavaScript was turned into on the way out.
+            if (limitErrorOrTime.is<kj::Exception>()) {
+              kj::throwException(kj::mv(limitErrorOrTime.get<kj::Exception>()));
+            }
             kj::throwException(kj::mv(ex));
+          }
+
+          // Executor fork: a limit that ended the import cancels the termination when its scope
+          // ends, so the caught value is the termination's, not an error of the module's: report
+          // the limit.
+          if (limitErrorOrTime.is<kj::Exception>()) {
+            kj::throwException(kj::mv(limitErrorOrTime.get<kj::Exception>()));
           }
 
           KJ_ASSERT(tryCatch.HasCaught());

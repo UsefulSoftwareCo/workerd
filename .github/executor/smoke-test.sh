@@ -357,6 +357,7 @@ export default { async fetch(request) {
   if (mode === 'wasm') { new WebAssembly.Instance(spin).exports.spin(); }
   if (mode === 'busy') { let x = 0; for (let i = 0, n = Number(url.searchParams.get('n')); i < n; i++) x += i; if (x < 0) hits = 0; }
   if (mode === 'wait') { await new Promise((resolve) => setTimeout(resolve, Number(url.searchParams.get('ms')))); }
+  if (mode === 'import') { await import('./heavy.js'); }
   return new Response(String(hits));
 } }`;
 export default {
@@ -372,9 +373,14 @@ export default {
     const stub = env.LOADER.get(name, () => {
       loads[name] = (loads[name] ?? 0) + 1;
       return {
-        compatibilityDate: '2026-01-01',
+        // registry=new: the new module registry, which a later compatibility date turns on.
+        compatibilityDate: url.searchParams.get('registry') === 'new' ? '2026-11-17' : '2026-01-01',
         mainModule: 'child.js',
-        modules: { 'child.js': child(name, loads[name] === 1), 'spin.wasm': { wasm: spinBytes } },
+        modules: {
+          'child.js': child(name, loads[name] === 1),
+          'spin.wasm': { wasm: spinBytes },
+          'heavy.js': 'for (;;) {}\nexport const done = true;',
+        },
       };
     });
     const start = Date.now();
@@ -482,6 +488,12 @@ expect_match "http://127.0.0.1:$L/health" '^ok$'
 # A WebAssembly loop ends the same way.
 expect_ms_between "http://127.0.0.1:$L/?name=w&mode=wasm" 450 1500 "$CPU_ERROR"
 expect_match "http://127.0.0.1:$L/?name=w" '^200 [0-9]+ 1$'
+# A dynamic import of a module whose top level does not finish ends the same way with either module
+# registry, and the name's next call starts a fresh isolate.
+expect_ms_between "http://127.0.0.1:$L/?name=imp&mode=import" 450 1500 "$CPU_ERROR"
+expect_match "http://127.0.0.1:$L/?name=imp" '^200 [0-9]+ 1$'
+expect_ms_between "http://127.0.0.1:$L/?name=impnew&mode=import&registry=new" 450 1500 "$CPU_ERROR"
+expect_match "http://127.0.0.1:$L/?name=impnew&registry=new" '^200 [0-9]+ 1$'
 # A loop at the top level fails the load; the name's next load compiles afresh.
 expect_ms_between "http://127.0.0.1:$L/?name=top" 450 1500 "$CPU_ERROR"
 expect_match "http://127.0.0.1:$L/?name=top" '^200 [0-9]+ 1$'

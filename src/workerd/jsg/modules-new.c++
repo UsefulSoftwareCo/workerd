@@ -1551,6 +1551,9 @@ v8::MaybeLocal<v8::Promise> dynamicImportModuleCallback(v8::Local<v8::Context> c
     });
   }
   KJ_CATCH(exception) {
+    // Executor fork: while JavaScript execution is being terminated (a limit ended it), let the
+    // termination continue instead of turning it into a rejected promise the code can go on with.
+    if (js.v8Isolate->IsExecutionTerminating()) return {};
     auto ex = js.exceptionToJsValue(kj::mv(exception));
     return rejected(js, ex.getHandle(js));
   }

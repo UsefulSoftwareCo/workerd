@@ -211,6 +211,15 @@ class SliceLimitEnforcer final: public LimitEnforcer {
 
     ~Scope() noexcept(false) {
       auto fired = enforcer.watchdog->disarm(*slice);
+      // A dynamic import runs under a lock of its own, between this request's slices; a limit
+      // that ended one counts as this request's.
+      if (!fired) {
+        KJ_IF_SOME(isolate,
+            kj::tryDowncast<const SliceLimitedIsolateLimitEnforcer>(
+                context.getWorker().getIsolate().getLimitEnforcer())) {
+          fired = isolate.takeDynamicImportBreach();
+        }
+      }
       if (fired) enforcer.breached(lock, context);
     }
 
@@ -259,34 +268,43 @@ SliceLimitedIsolateLimitEnforcer::SliceLimitedIsolateLimitEnforcer(
 
 kj::Own<void> SliceLimitedIsolateLimitEnforcer::enterStartupJs(
     jsg::Lock& lock, kj::OneOf<kj::Exception, kj::Duration>& limitErrorOrTime) const {
-  return enterLimited(lock, limitErrorOrTime, inner->enterStartupJs(lock, limitErrorOrTime));
+  return enterLimited(
+      lock, limitErrorOrTime, inner->enterStartupJs(lock, limitErrorOrTime), false);
 }
 
 kj::Own<void> SliceLimitedIsolateLimitEnforcer::enterDynamicImportJs(
     jsg::Lock& lock, kj::OneOf<kj::Exception, kj::Duration>& limitErrorOrTime) const {
-  return enterLimited(lock, limitErrorOrTime, inner->enterDynamicImportJs(lock, limitErrorOrTime));
+  return enterLimited(
+      lock, limitErrorOrTime, inner->enterDynamicImportJs(lock, limitErrorOrTime), true);
 }
 
 kj::Own<void> SliceLimitedIsolateLimitEnforcer::enterLimited(jsg::Lock& lock,
     kj::OneOf<kj::Exception, kj::Duration>& limitErrorOrTime,
-    kj::Own<void> innerScope) const {
+    kj::Own<void> innerScope,
+    bool dynamicImport) const {
   class Scope {
    public:
     Scope(const SliceLimitedIsolateLimitEnforcer& enforcer,
         jsg::Lock& lock,
         kj::OneOf<kj::Exception, kj::Duration>& limitErrorOrTime,
-        kj::Own<void> inner)
+        kj::Own<void> inner,
+        bool dynamicImport)
         : enforcer(enforcer),
           lock(lock),
           limitErrorOrTime(limitErrorOrTime),
           inner(kj::mv(inner)),
+          dynamicImport(dynamicImport),
           slice(enforcer.watchdog->arm(lock.v8Isolate)) {}
 
     ~Scope() noexcept(false) {
       if (!enforcer.watchdog->disarm(*slice)) return;
       lock.v8Isolate->CancelTerminateExecution();
       limitErrorOrTime = sliceLimitException();
-      enforcer.startupExceeded = true;
+      if (dynamicImport) {
+        enforcer.dynamicImportExceeded = true;
+      } else {
+        enforcer.startupExceeded = true;
+      }
     }
 
    private:
@@ -294,9 +312,10 @@ kj::Own<void> SliceLimitedIsolateLimitEnforcer::enterLimited(jsg::Lock& lock,
     jsg::Lock& lock;
     kj::OneOf<kj::Exception, kj::Duration>& limitErrorOrTime;
     kj::Own<void> inner;
+    bool dynamicImport;
     kj::Own<SliceWatchdog::Slice> slice;
   };
-  return kj::heap<Scope>(*this, lock, limitErrorOrTime, kj::mv(innerScope));
+  return kj::heap<Scope>(*this, lock, limitErrorOrTime, kj::mv(innerScope), dynamicImport);
 }
 
 }  // namespace workerd::server
