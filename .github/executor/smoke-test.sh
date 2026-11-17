@@ -140,4 +140,12 @@ expect_log loader "executor: unloaded idle Worker loader isolates"
 expect "http://127.0.0.1:18084/?name=a" 1
 expect "http://127.0.0.1:18084/?name=a" 2
 
+# The same with the inspector enabled: loading a name again after it was unloaded must work.
+write_config inspector 18085 "memory = (maintenanceIntervalMs = 100, workerLoaderIdleTtlMs = 500),"
+INSPECTOR=19229 start inspector 18085
+expect "http://127.0.0.1:18085/?name=a" 1
+sleep 1.5
+expect_log inspector "executor: unloaded idle Worker loader isolates"
+expect "http://127.0.0.1:18085/?name=a" 1
+
 echo "smoke test passed"
