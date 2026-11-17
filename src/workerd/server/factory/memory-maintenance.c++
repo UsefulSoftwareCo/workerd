@@ -28,6 +28,8 @@
 
 #include "memory-maintenance.h"
 
+#include "slice-limit.h"
+
 #include <workerd/io/io-context.h>
 #include <workerd/jsg/jsg.h>
 
@@ -92,10 +94,13 @@ void releaseFreeMallocMemory() {
 // 10000 tasks. This may run while requests of the isolate are suspended, the same as a
 // FinalizationRegistry callback running at the end of another request would. When JavaScript
 // execution is terminated, it stops and does not pump again.
+//
 void pumpForegroundTasks(jsg::Lock& js, const Worker::Isolate& isolate) {
   SuppressIoContextScope noIoContext;
   for (uint i = 0; i < 10000 && js.pumpMsgLoop(); ++i) {
     if (isolate.getLimitEnforcer().hasExcessivelyExceededHeapLimit()) break;
+    // A task ended with the CPU slice limit (see maintain()).
+    if (currentSliceExceeded()) break;
     v8::TryCatch tryCatch(js.v8Isolate);
     js.runMicrotasks();
     if (tryCatch.HasCaught()) {
@@ -103,6 +108,21 @@ void pumpForegroundTasks(jsg::Lock& js, const Worker::Isolate& isolate) {
       break;
     }
   }
+}
+
+// Runs `work`, maintenance of `isolate` under its lock, which may run the isolate's JavaScript. The
+// isolate of a Worker loader's Worker runs it under the CPU slice limit (`Config.dynamicWorkerLimits`):
+// the collection, which may run the isolate's weak callbacks, and every task and microtask pumped.
+// Work that ends with the limit leaves the isolate with a pending breach (its next request fails
+// with the limit and unloads it), and maintenance does nothing more in that isolate.
+void maintain(jsg::Lock& js, const Worker::Isolate& isolate, kj::FunctionParam<void()> work) {
+  kj::Own<void> limitScope;
+  KJ_IF_SOME(limited,
+      kj::tryDowncast<const SliceLimitedIsolateLimitEnforcer>(isolate.getLimitEnforcer())) {
+    if (limited.hasPendingBreach()) return;
+    limitScope = limited.enterMaintenanceJs(js);
+  }
+  work();
 }
 
 // True when the isolate's last full collection happened at lock count `count`.
@@ -289,15 +309,17 @@ kj::Promise<void> MemoryMaintenance::collectIdle(kj::Rc<IsolateEntry> entry) {
 
     bool stillCollected = isCollectedAt(*entry, entry->lastLockCount);
     isolate->runInLockScope(asyncLock, [&](jsg::Lock& js) {
-      pumpForegroundTasks(js, *isolate);
-      if (full) {
-        js.v8Isolate->LowMemoryNotification();
-      } else {
-        // V8 can trim caches on this notification. It starts no heap collection in this build,
-        // which disables incremental marking.
-        js.v8Isolate->MemoryPressureNotification(v8::MemoryPressureLevel::kModerate);
-      }
-      pumpForegroundTasks(js, *isolate);
+      maintain(js, *isolate, [&]() {
+        pumpForegroundTasks(js, *isolate);
+        if (full) {
+          js.v8Isolate->LowMemoryNotification();
+        } else {
+          // V8 can trim caches on this notification. It starts no heap collection in this build,
+          // which disables incremental marking.
+          js.v8Isolate->MemoryPressureNotification(v8::MemoryPressureLevel::kModerate);
+        }
+        pumpForegroundTasks(js, *isolate);
+      });
     });
     entry->lastLockCount = isolate->getLockSuccessCount();
     if (full || stillCollected) entry->collectedAtLockCount = entry->lastLockCount;
@@ -339,7 +361,9 @@ kj::Promise<void> MemoryMaintenance::pumpWhileIdle(
     auto asyncLock = co_await isolate->takeAsyncLockWithoutRequest(nullptr);
     if (isolate->getLockSuccessCount() != entry->lastLockCount) co_return;
     bool stillCollected = isCollectedAt(*entry, entry->lastLockCount);
-    isolate->runInLockScope(asyncLock, [&](jsg::Lock& js) { pumpForegroundTasks(js, *isolate); });
+    isolate->runInLockScope(asyncLock, [&](jsg::Lock& js) {
+      maintain(js, *isolate, [&]() { pumpForegroundTasks(js, *isolate); });
+    });
     entry->lastLockCount = isolate->getLockSuccessCount();
     // Our own lock is not activity: a full collection before it still covers the isolate.
     if (stillCollected) entry->collectedAtLockCount = entry->lastLockCount;
@@ -416,8 +440,10 @@ kj::Promise<bool> MemoryMaintenance::collectUnderPressure(kj::Rc<IsolateEntry> e
   auto asyncLock = co_await isolate->takeAsyncLockWithoutRequest(nullptr);
   bool wasIdle = isolate->getLockSuccessCount() == entry->lastLockCount;
   isolate->runInLockScope(asyncLock, [&](jsg::Lock& js) {
-    js.v8Isolate->LowMemoryNotification();
-    pumpForegroundTasks(js, *isolate);
+    maintain(js, *isolate, [&]() {
+      js.v8Isolate->LowMemoryNotification();
+      pumpForegroundTasks(js, *isolate);
+    });
   });
   entry->lastLockCount = isolate->getLockSuccessCount();
   entry->collectedAtLockCount = entry->lastLockCount;

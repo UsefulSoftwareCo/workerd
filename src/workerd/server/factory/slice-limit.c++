@@ -25,20 +25,31 @@
 #include <workerd/util/exception.h>
 
 #include <pthread.h>
+
+#include <atomic>
 #include <time.h>
 
 namespace workerd::server {
 
 struct SliceWatchdog::Slice {
+  Slice(const SliceWatchdog& watchdog, v8::Isolate* isolate, kj::TimePoint checkAt)
+      : watchdog(watchdog),
+        isolate(isolate),
+        checkAt(checkAt) {}
+
   const SliceWatchdog& watchdog;
   v8::Isolate* isolate;
-  clockid_t cpuClock;
-  int64_t cpuStartNs;
+  clockid_t cpuClock = 0;
+  int64_t cpuStartNs = 0;
   // When the watchdog next reads this slice's CPU time. The slice cannot have used the limit
   // before then, since CPU time never runs faster than the monotonic clock.
   kj::TimePoint checkAt;
-  // Set by the watchdog, under the state mutex, when it terminated the slice's JavaScript.
-  bool fired = false;
+  // Set by the watchdog, under the state mutex, when it ended the slice's JavaScript. Also read
+  // without the mutex, by native code of the slice's own thread (SQLite's interrupt check).
+  std::atomic<bool> fired = false;
+  // The slice of this thread this one is nested in, if any.
+  Slice* outer = nullptr;
+  bool armed = true;
 
   // A slice is always disarmed before it is destroyed; this only covers unwinding past a scope.
   ~Slice() noexcept(false) {
@@ -47,6 +58,9 @@ struct SliceWatchdog::Slice {
 };
 
 namespace {
+
+// The innermost slice of this thread that is armed.
+thread_local SliceWatchdog::Slice* currentSlice = nullptr;
 
 int64_t readCpuNs(clockid_t clock) {
   struct timespec ts;
@@ -69,20 +83,21 @@ SliceWatchdog::~SliceWatchdog() noexcept(false) {
 }
 
 kj::Own<SliceWatchdog::Slice> SliceWatchdog::arm(v8::Isolate* isolate) const {
-  clockid_t cpuClock;
-  KJ_REQUIRE(pthread_getcpuclockid(pthread_self(), &cpuClock) == 0);
-  auto slice = kj::heap<Slice>(Slice{
-    .watchdog = *this,
-    .isolate = isolate,
-    .cpuClock = cpuClock,
-    .cpuStartNs = readCpuNs(cpuClock),
-    .checkAt = kj::systemPreciseMonotonicClock().now() + limit,
-  });
+  auto slice = kj::heap<Slice>(*this, isolate, kj::systemPreciseMonotonicClock().now() + limit);
+  KJ_REQUIRE(pthread_getcpuclockid(pthread_self(), &slice->cpuClock) == 0);
+  slice->cpuStartNs = readCpuNs(slice->cpuClock);
+  slice->outer = currentSlice;
+  currentSlice = slice.get();
   state.lockExclusive()->active.add(slice.get());
   return slice;
 }
 
 bool SliceWatchdog::disarm(Slice& slice) const {
+  if (slice.armed) {
+    slice.armed = false;
+    // Slices end in the reverse order they start on a thread.
+    if (currentSlice == &slice) currentSlice = slice.outer;
+  }
   auto lock = state.lockExclusive();
   auto& active = lock->active;
   for (size_t i = 0; i < active.size(); i++) {
@@ -92,7 +107,7 @@ bool SliceWatchdog::disarm(Slice& slice) const {
       break;
     }
   }
-  return slice.fired;
+  return slice.fired.load(std::memory_order_relaxed);
 }
 
 void SliceWatchdog::run() const {
@@ -101,10 +116,16 @@ void SliceWatchdog::run() const {
   while (!lock->stop) {
     auto now = clock.now();
     for (auto slice: lock->active) {
-      if (slice->fired || now < slice->checkAt) continue;
+      if (slice->fired.load(std::memory_order_relaxed)) {
+        // V8 forgets a termination once no JavaScript is on the stack, so JavaScript the slice
+        // enters again (the next task of a loop that runs tasks) would run on: end it again.
+        slice->isolate->TerminateExecution();
+        continue;
+      }
+      if (now < slice->checkAt) continue;
       auto used = (readCpuNs(slice->cpuClock) - slice->cpuStartNs) * kj::NANOSECONDS;
       if (used >= limit) {
-        slice->fired = true;
+        slice->fired.store(true, std::memory_order_relaxed);
         // Safe from any thread. The slice's thread is blocked on this mutex before the slice ends,
         // so the isolate is alive.
         slice->isolate->TerminateExecution();
@@ -120,6 +141,20 @@ kj::Exception sliceLimitException() {
   auto exception = JSG_KJ_EXCEPTION(OVERLOADED, Error, "Worker exceeded CPU time limit.");
   exception.setDetail(CPU_LIMIT_DETAIL_ID, kj::heapArray<kj::byte>(0));
   return exception;
+}
+
+void endCurrentSlice() {
+  KJ_ASSERT(currentSlice != nullptr, "endCurrentSlice() outside a slice");
+  // Raises V8's uncatchable termination at once, as abortIsolate() does: requesting it would let
+  // the calling JavaScript run on until its next interrupt check.
+  jsg::Lock::current().terminateExecutionNow();
+}
+
+bool currentSliceExceeded() {
+  for (auto slice = currentSlice; slice != nullptr; slice = slice->outer) {
+    if (slice->fired.load(std::memory_order_relaxed)) return true;
+  }
+  return false;
 }
 
 namespace {
@@ -207,18 +242,21 @@ class SliceLimitEnforcer final: public LimitEnforcer {
           lock(lock),
           context(context),
           inner(kj::mv(inner)),
-          slice(enforcer.watchdog->arm(lock.v8Isolate)) {}
+          slice(enforcer.watchdog->arm(lock.v8Isolate)) {
+      // A breach recorded outside this request's slices (a dynamic import, or maintenance)
+      // counts as this request's: end this slice before any of its JavaScript runs.
+      KJ_IF_SOME(isolate, isolateEnforcer()) {
+        if (isolate.takePendingBreach()) {
+          pending = true;
+          lock.v8Isolate->TerminateExecution();
+        }
+      }
+    }
 
     ~Scope() noexcept(false) {
-      auto fired = enforcer.watchdog->disarm(*slice);
-      // A dynamic import runs under a lock of its own, between this request's slices; a limit
-      // that ended one counts as this request's.
-      if (!fired) {
-        KJ_IF_SOME(isolate,
-            kj::tryDowncast<const SliceLimitedIsolateLimitEnforcer>(
-                context.getWorker().getIsolate().getLimitEnforcer())) {
-          fired = isolate.takeDynamicImportBreach();
-        }
+      auto fired = enforcer.watchdog->disarm(*slice) || pending;
+      KJ_IF_SOME(isolate, isolateEnforcer()) {
+        if (isolate.takePendingBreach()) fired = true;
       }
       if (fired) enforcer.breached(lock, context);
     }
@@ -229,6 +267,12 @@ class SliceLimitEnforcer final: public LimitEnforcer {
     IoContext& context;
     kj::Own<void> inner;
     kj::Own<SliceWatchdog::Slice> slice;
+    bool pending = false;
+
+    kj::Maybe<const SliceLimitedIsolateLimitEnforcer&> isolateEnforcer() {
+      return kj::tryDowncast<const SliceLimitedIsolateLimitEnforcer>(
+          context.getWorker().getIsolate().getLimitEnforcer());
+    }
   };
 
   kj::Arc<const SliceWatchdog> watchdog;
@@ -278,6 +322,34 @@ kj::Own<void> SliceLimitedIsolateLimitEnforcer::enterDynamicImportJs(
       lock, limitErrorOrTime, inner->enterDynamicImportJs(lock, limitErrorOrTime), true);
 }
 
+kj::Own<void> SliceLimitedIsolateLimitEnforcer::enterMaintenanceJs(jsg::Lock& lock) const {
+  class Scope {
+   public:
+    Scope(const SliceLimitedIsolateLimitEnforcer& enforcer, jsg::Lock& lock)
+        : enforcer(enforcer),
+          lock(lock),
+          slice(enforcer.watchdog->arm(lock.v8Isolate)) {}
+
+    ~Scope() noexcept(false) {
+      if (!enforcer.watchdog->disarm(*slice)) return;
+      lock.v8Isolate->CancelTerminateExecution();
+      if (!enforcer.pendingBreach) {
+        KJ_LOG(WARNING,
+            "executor: Worker loader Worker exceeded its CPU slice limit outside a request; its "
+            "next request unloads it",
+            enforcer.watchdog->getLimit());
+      }
+      enforcer.pendingBreach = true;
+    }
+
+   private:
+    const SliceLimitedIsolateLimitEnforcer& enforcer;
+    jsg::Lock& lock;
+    kj::Own<SliceWatchdog::Slice> slice;
+  };
+  return kj::heap<Scope>(*this, lock);
+}
+
 kj::Own<void> SliceLimitedIsolateLimitEnforcer::enterLimited(jsg::Lock& lock,
     kj::OneOf<kj::Exception, kj::Duration>& limitErrorOrTime,
     kj::Own<void> innerScope,
@@ -301,7 +373,7 @@ kj::Own<void> SliceLimitedIsolateLimitEnforcer::enterLimited(jsg::Lock& lock,
       lock.v8Isolate->CancelTerminateExecution();
       limitErrorOrTime = sliceLimitException();
       if (dynamicImport) {
-        enforcer.dynamicImportExceeded = true;
+        enforcer.pendingBreach = true;
       } else {
         enforcer.startupExceeded = true;
       }

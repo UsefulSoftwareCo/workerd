@@ -77,6 +77,19 @@ class SqliteDatabase {
   // Allow 34 bytes of padding for V8 serialization overhead beyond the 8 MiB row limit.
   static constexpr int MAX_ROW_LENGTH = 8 * 1024 * 1024 + 34;
 
+  // Executor fork: a process-wide check that ends a statement while it runs. When set, every
+  // database opened afterwards asks `requested()` every few thousand SQLite instructions. A
+  // statement it is asked to end is interrupted (SQLite rolls back what it ended), the database's
+  // critical-error handling is told so with `error()`, and then `end()`, which does not return,
+  // ends the statement's caller. Set it once, before any database is opened; it is never unset.
+  struct InterruptCheck {
+    bool (*requested)();
+    kj::Exception (*error)();
+    // Does not return.
+    void (*end)();
+  };
+  static void setInterruptCheck(InterruptCheck check);
+
   class Vfs;
   class Query;
   class Statement;

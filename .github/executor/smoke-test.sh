@@ -7,7 +7,12 @@ set -euo pipefail
 
 WORKERD="$1"
 DIR="$(mktemp -d)"
-trap 'kill $(jobs -p) 2>/dev/null || true; rm -rf "$DIR"' EXIT
+# The longest any one request may take. A missing limit, or a hung server, fails the check that
+# made the request instead of holding the run.
+REQUEST_TIMEOUT=${REQUEST_TIMEOUT:-30}
+# SIGKILL: a server whose thread is held (a limit that does not work) would ignore SIGTERM and keep
+# its port.
+trap 'kill -9 $(jobs -p) 2>/dev/null || true; rm -rf "$DIR"' EXIT
 
 cat > "$DIR/parent.js" <<'JS'
 // Loads a named child Worker through the Worker loader. The child keeps a module-level counter,
@@ -80,7 +85,7 @@ start() {
   "$WORKERD" serve --experimental --verbose ${INSPECTOR:+--inspector-addr=127.0.0.1:$INSPECTOR} "$DIR/$1.capnp" > "$DIR/$1.log" 2>&1 &
   WPID=$!
   for _ in $(seq 1 100); do
-    if curl -sf "http://127.0.0.1:$2/?name=probe" > /dev/null; then return 0; fi
+    if curl -sf -m 2 "http://127.0.0.1:$2/?name=probe" > /dev/null; then return 0; fi
     sleep 0.1
   done
   cat "$DIR/$1.log"
@@ -90,7 +95,7 @@ start() {
 
 expect() {
   local got
-  got="$(curl -sf "$1")" || { echo "FAIL: $1 failed (curl exit $?)" >&2; exit 1; }
+  got="$(curl -sf -m "$REQUEST_TIMEOUT" "$1")" || { echo "FAIL: $1 failed (curl exit $?)" >&2; exit 1; }
   if [ "$got" != "$2" ]; then
     echo "FAIL: $1 returned '$got', expected '$2'" >&2
     exit 1
@@ -193,8 +198,8 @@ if [ "$(uname -s)" = "Linux" ]; then
   native_after() { # NAME PORT MEMORY: the resident set 10 s after the collection, in MiB.
     write_config "$1" "$2" "memory = (maintenanceIntervalMs = 100, idleIsolateGcDelayMs = 500, idleIsolateGcMode = full$3),"
     start "$1" "$2"
-    curl -sf -o /dev/null "http://127.0.0.1:$2/?name=a&mode=native"
-    curl -sf -o /dev/null "http://127.0.0.1:$2/?name=a&mode=dropnative"
+    curl -sf -m "$REQUEST_TIMEOUT" -o /dev/null "http://127.0.0.1:$2/?name=a&mode=native"
+    curl -sf -m "$REQUEST_TIMEOUT" -o /dev/null "http://127.0.0.1:$2/?name=a&mode=dropnative"
     sleep 10
     rss_mb
     # Started in this command substitution's subshell, so the script's exit trap would not stop it.
@@ -208,9 +213,10 @@ if [ "$(uname -s)" = "Linux" ]; then
   [ $(( kept - background )) -ge 12 ] || { echo "FAIL: the background release left $background MiB against $kept MiB without it" >&2; exit 1; }
   echo "ok: both releases return freed native memory to the OS"
 
-  # Memory pressure pacing. A 1 ms budget per 200 ms interval, and a full collection of each child
-  # isolate (two with about 10 MB of live objects) taking longer than that, so a pass collects one
-  # isolate per interval: a pass that collects k isolates spans at least k - 1 intervals. Usage stays
+  # Memory pressure pacing. A 1 ms budget per 200 ms interval, and a full collection of each of the
+  # two child isolates with about 10 MB of live objects taking longer than that, so a pass that
+  # collects them cannot finish within one interval: it spans at least one more. (Small isolates
+  # can collect in under 1 ms, several in one interval, so the bound counts only the two large.) Usage stays
   # above the 1 MiB threshold, so the 500 ms cooldown doubles after every pass. Measured from the
   # first pass that collects at least three isolates (passes skip isolates that have not run since
   # their last collection, so how many a pass finds depends on when the children were made). The log
@@ -218,9 +224,9 @@ if [ "$(uname -s)" = "Linux" ]; then
   write_config pace 18090 "memory = (maintenanceIntervalMs = 200, pressureThresholdMb = 1, pressureCooldownMs = 500, pressureGcBudgetMs = 1),"
   "$WORKERD" serve --experimental --verbose "$DIR/pace.capnp" 2>&1 \
     | while IFS= read -r line; do printf '%s %s\n' "$(date +%s%3N)" "$line"; done > "$DIR/pace.log" &
-  for _ in $(seq 1 100); do curl -sf -o /dev/null "http://127.0.0.1:18090/?name=probe" && break; sleep 0.1; done
+  for _ in $(seq 1 100); do curl -sf -m "$REQUEST_TIMEOUT" -o /dev/null "http://127.0.0.1:18090/?name=probe" && break; sleep 0.1; done
   for i in 1 2 3 4 5 6; do
-    curl -sf -o /dev/null "http://127.0.0.1:18090/?name=p$i&mode=$([ $i -le 2 ] && echo fillsmall || echo count)"
+    curl -sf -m "$REQUEST_TIMEOUT" -o /dev/null "http://127.0.0.1:18090/?name=p$i&mode=$([ $i -le 2 ] && echo fillsmall || echo count)"
   done
   pace_ready() { # prints "K COLLECTED" for the first pass K with at least 3 collected, once two more passes started
     local counts k
@@ -241,7 +247,7 @@ if [ "$(uname -s)" = "Linux" ]; then
   ends=($(grep "executor: memory pressure pass done" "$DIR/pace.log" | awk '{print $1}'))
   pass=$(( ends[k] - starts[k] )); gap1=$(( starts[k + 1] - ends[k] )); gap2=$(( starts[k + 2] - ends[k + 1] ))
   echo "pace: pass $k collected $collected isolates in ${pass} ms; the next passes waited ${gap1} ms and ${gap2} ms"
-  [ "$pass" -ge $(( (collected - 1) * 150 )) ] || { echo "FAIL: pace: $collected isolates in $pass ms, so the pass did not keep to its budget" >&2; exit 1; }
+  [ "$pass" -ge 150 ] || { echo "FAIL: pace: $collected isolates in $pass ms, so the pass did not keep to its budget" >&2; exit 1; }
   [ "$gap1" -ge 750 ] || { echo "FAIL: pace: $gap1 ms before the next pass, under the cooldown" >&2; exit 1; }
   [ $(( gap2 * 2 )) -ge $(( gap1 * 3 )) ] || { echo "FAIL: pace: $gap2 ms after $gap1 ms, so the cooldown did not double" >&2; exit 1; }
   echo "ok: pressure passes keep to their budget and cooldown"
@@ -348,7 +354,11 @@ import spinBytes from './spin.bin';
 const loads = {};
 const child = (name, first) => `import spin from './spin.wasm';
 let hits = 0;
-${name === 'top' && first ? 'for (;;) {}' : ''}
+${first ? ({
+  top: 'for (;;) {}',
+  topmicro: 'Promise.resolve().then(() => { for (;;) {} });',
+  topchain: 'const chain = () => Promise.resolve().then(chain); chain();',
+})[name] ?? '' : ''}
 export default { async fetch(request) {
   hits += 1;
   const url = new URL(request.url);
@@ -358,6 +368,12 @@ export default { async fetch(request) {
   if (mode === 'busy') { let x = 0; for (let i = 0, n = Number(url.searchParams.get('n')); i < n; i++) x += i; if (x < 0) hits = 0; }
   if (mode === 'wait') { await new Promise((resolve) => setTimeout(resolve, Number(url.searchParams.get('ms')))); }
   if (mode === 'import') { await import('./heavy.js'); }
+  if (mode === 'finalizer') {
+    const registry = new FinalizationRegistry(() => { for (;;) {} });
+    for (let i = 0; i < 1000; i++) registry.register({ junk: new Array(100).fill(i) }, i);
+    globalThis.keepRegistry = registry;
+    return new Response('armed');
+  }
   return new Response(String(hits));
 } }`;
 export default {
@@ -418,7 +434,8 @@ CAPNP
 # expect_match URL REGEX: the response, on one line, must match REGEX (grep -E).
 expect_match() {
   local got
-  got="$(curl -sf "$1" | tr '\n' ' ')"
+  got="$(curl -sf -m "$REQUEST_TIMEOUT" "$1" | tr '\n' ' ')" \
+    || { echo "FAIL: $1 failed (curl exit ${PIPESTATUS[0]:-?}): no answer within ${REQUEST_TIMEOUT} s, or none at all" >&2; exit 1; }
   if ! printf '%s' "$got" | grep -qE "$2"; then
     echo "FAIL: $1 returned '$got', expected /$2/" >&2
     exit 1
@@ -430,7 +447,8 @@ expect_match() {
 # second word) is within [MIN, MAX] ms.
 expect_ms_between() {
   local got ms
-  got="$(curl -sf "$1" | tr '\n' ' ')"
+  got="$(curl -sf -m "$REQUEST_TIMEOUT" "$1" | tr '\n' ' ')" \
+    || { echo "FAIL: $1 failed (curl exit ${PIPESTATUS[0]:-?}): no answer within ${REQUEST_TIMEOUT} s, or none at all" >&2; exit 1; }
   ms="$(printf '%s' "$got" | awk '{print $2}')"
   if ! printf '%s' "$got" | grep -qE "$4" || [ "$ms" -lt "$2" ] || [ "$ms" -gt "$3" ]; then
     echo "FAIL: $1 returned '$got', expected /$4/ in $2..$3 ms" >&2
@@ -441,7 +459,10 @@ expect_ms_between() {
 
 # wall_ms URL: the wall time of a request, in ms.
 wall_ms() {
-  curl -sf -o /dev/null -w '%{time_total}' "$1" | awk '{printf "%d", $1 * 1000}'
+  local t
+  t="$(curl -sf -m "$REQUEST_TIMEOUT" -o /dev/null -w '%{time_total}' "$1")" \
+    || { echo "FAIL: $1 failed (curl exit $?): no answer within ${REQUEST_TIMEOUT} s, or none at all" >&2; exit 1; }
+  printf '%s' "$t" | awk '{printf "%d", $1 * 1000}'
 }
 
 CPU_ERROR='^error [0-9]+ .*exceeded CPU time limit'
@@ -470,11 +491,11 @@ expect_match "http://127.0.0.1:$L/?name=a" '^200 [0-9]+ 1$'
 expect_match "http://127.0.0.1:$L/?name=b" '^200 [0-9]+ 1$'
 # A JavaScript loop ends at about the limit while the config Worker waits for the thread; the
 # failed name's next call starts a fresh isolate, and the other loader Worker keeps its state.
-curl -sf "http://127.0.0.1:$L/?name=a&mode=loop" > "$DIR/loop.out" &
+curl -sf -m "$REQUEST_TIMEOUT" "http://127.0.0.1:$L/?name=a&mode=loop" > "$DIR/loop.out" &
 loop=$!
 sleep 0.1
 health_ms=$(wall_ms "http://127.0.0.1:$L/health")
-wait $loop
+wait $loop || { echo "FAIL: the looping call got no answer within ${REQUEST_TIMEOUT} s (curl exit $?)" >&2; exit 1; }
 got="$(cat "$DIR/loop.out")"
 printf '%s' "$got" | grep -qE "$CPU_ERROR" || { echo "FAIL: loop returned '$got'" >&2; exit 1; }
 loop_ms="$(printf '%s' "$got" | awk '{print $2}')"
@@ -492,11 +513,19 @@ expect_match "http://127.0.0.1:$L/?name=w" '^200 [0-9]+ 1$'
 # registry, and the name's next call starts a fresh isolate.
 expect_ms_between "http://127.0.0.1:$L/?name=imp&mode=import" 450 1500 "$CPU_ERROR"
 expect_match "http://127.0.0.1:$L/?name=imp" '^200 [0-9]+ 1$'
+expect_ms_between "http://127.0.0.1:$L/?name=imp&mode=import" 450 1500 "$CPU_ERROR"
+expect_match "http://127.0.0.1:$L/?name=imp" '^200 [0-9]+ 1$'
 expect_ms_between "http://127.0.0.1:$L/?name=impnew&mode=import&registry=new" 450 1500 "$CPU_ERROR"
 expect_match "http://127.0.0.1:$L/?name=impnew&registry=new" '^200 [0-9]+ 1$'
 # A loop at the top level fails the load; the name's next load compiles afresh.
 expect_ms_between "http://127.0.0.1:$L/?name=top" 450 1500 "$CPU_ERROR"
 expect_match "http://127.0.0.1:$L/?name=top" '^200 [0-9]+ 1$'
+# The same when the top level queues the work in a microtask, or as a promise chain that never
+# ends: the load fails with the limit, and is not taken for a started Worker.
+expect_ms_between "http://127.0.0.1:$L/?name=topmicro" 450 1500 "$CPU_ERROR"
+expect_match "http://127.0.0.1:$L/?name=topmicro" '^200 [0-9]+ 1$'
+expect_ms_between "http://127.0.0.1:$L/?name=topchain" 450 1500 "$CPU_ERROR"
+expect_match "http://127.0.0.1:$L/?name=topchain" '^200 [0-9]+ 1$'
 # Under the limit, waiting longer than it, and the config Worker: never limited.
 expect_match "http://127.0.0.1:$L/?name=c&mode=busy&n=$(( per_ms * 150 ))" '^200 [0-9]+ 1$'
 expect_ms_between "http://127.0.0.1:$L/?name=c&mode=wait&ms=2000" 1900 4000 '^200 [0-9]+ 2$'
@@ -504,5 +533,112 @@ expect_match "http://127.0.0.1:$L/static-busy?n=$(( per_ms * 1500 ))" '^static o
 if grep -q "exceeded its CPU slice limit.*\"parent\"" "$DIR/limit.log"; then
   cat "$DIR/limit.log"; echo "FAIL: the config Worker was limited" >&2; exit 1
 fi
+
+# Memory maintenance runs a loader Worker's pending tasks under the limit too. Its finalizer never
+# returns; the idle collection runs it, the limit ends it, and the server keeps answering. The
+# Worker's next request fails with the limit and unloads it, and the one after starts afresh.
+L=18095
+write_limit_config limitmaint $L "dynamicWorkerLimits = (sliceCpuMs = 500), memory = (maintenanceIntervalMs = 100, idleIsolateGcDelayMs = 500, idleIsolateGcMode = full, idleTaskPumpMs = 3000),"
+start limitmaint $L
+expect_match "http://127.0.0.1:$L/?name=fin&mode=finalizer" '^200 [0-9]+ armed$'
+expect_log limitmaint "executor: collected idle isolate; entry->name = LOADER:fin"
+expect_log limitmaint "executor: Worker loader Worker exceeded its CPU slice limit outside a request"
+expect_match "http://127.0.0.1:$L/health" '^ok$'
+expect_match "http://127.0.0.1:$L/?name=fin" "$CPU_ERROR"
+expect_match "http://127.0.0.1:$L/?name=fin" '^200 [0-9]+ 1$'
+
+# A SQL statement of a loader Worker's facet ends with the limit, its transaction rolled back, and
+# the facet's next call reads the data as it was. The same statement of a config Worker's Durable
+# Object is not limited.
+cat > "$DIR/sql-parent.js" <<'JS'
+import { DurableObject } from 'cloudflare:workers';
+const STORE = `import { DurableObject } from 'cloudflare:workers';
+export class Store extends DurableObject {
+  constructor(ctx, env) {
+    super(ctx, env);
+    ctx.storage.sql.exec('CREATE TABLE IF NOT EXISTS t (v TEXT)');
+  }
+  fetch(request) {
+    const sql = this.ctx.storage.sql;
+    const mode = new URL(request.url).searchParams.get('mode');
+    if (mode === 'put') sql.exec("INSERT INTO t VALUES ('kept')");
+    if (mode === 'count') sql.exec('WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c) SELECT max(x) FROM c').one();
+    if (mode === 'txcount') this.ctx.storage.transactionSync(() => {
+      sql.exec("INSERT INTO t VALUES ('never')");
+      sql.exec('WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c) SELECT max(x) FROM c').one();
+    });
+    return new Response(sql.exec('SELECT v FROM t').toArray().map((row) => row.v).join(','));
+  }
+}
+export default { fetch() { return new Response('store'); } };`;
+const code = () => ({ compatibilityDate: '2026-01-01', mainModule: 'store.js', modules: { 'store.js': STORE } });
+export class Host extends DurableObject {
+  async fetch(request) {
+    const url = new URL(request.url);
+    if (url.searchParams.get('own') === '1') {
+      this.ctx.storage.sql.exec('WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < ' + url.searchParams.get('n') + ') SELECT max(x) FROM c').one();
+      return new Response('own ok');
+    }
+    const facet = this.ctx.facets.get('store', () => ({
+      class: this.env.LOADER.get('store', code).getDurableObjectClass('Store'),
+    }));
+    return facet.fetch(request);
+  }
+}
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+    if (url.pathname === '/health') return new Response('ok');
+    if (url.searchParams.get('name') === 'probe') return new Response('ok');
+    const start = Date.now();
+    try {
+      const response = await env.HOST.get(env.HOST.idFromName('host')).fetch(request);
+      return new Response(`${response.status} ${Date.now() - start} ${await response.text()}`);
+    } catch (e) {
+      return new Response(`error ${Date.now() - start} ${String(e)}`);
+    }
+  },
+};
+JS
+mkdir -p "$DIR/sql-storage"
+cat > "$DIR/limitsql.capnp" <<CAPNP
+using Workerd = import "/workerd/workerd.capnp";
+const config :Workerd.Config = (
+  services = [
+    (name = "parent", worker = (
+      compatibilityDate = "2026-01-01",
+      compatibilityFlags = ["experimental"],
+      modules = [(name = "parent.js", esModule = embed "sql-parent.js")],
+      bindings = [(name = "LOADER", workerLoader = ()),
+                  (name = "HOST", durableObjectNamespace = "Host")],
+      durableObjectNamespaces = [(className = "Host", uniqueKey = "host", enableSql = true)],
+      durableObjectStorage = (localDisk = "storage"),
+    )),
+    (name = "storage", disk = (path = "$DIR/sql-storage", writable = true)),
+  ],
+  sockets = [(name = "http", address = "127.0.0.1:18096", http = (), service = "parent")],
+  dynamicWorkerLimits = (sliceCpuMs = 500),
+);
+CAPNP
+L=18096
+start limitsql $L
+expect_match "http://127.0.0.1:$L/?mode=put" '^200 [0-9]+ kept$'
+curl -sf -m "$REQUEST_TIMEOUT" "http://127.0.0.1:$L/?mode=count" > "$DIR/sqlcount.out" &
+sqlcount=$!
+sleep 0.2
+health_ms=$(wall_ms "http://127.0.0.1:$L/health")
+wait $sqlcount || { echo "FAIL: the SQL statement's call got no answer within ${REQUEST_TIMEOUT} s (curl exit $?)" >&2; exit 1; }
+got="$(tr '\n' ' ' < "$DIR/sqlcount.out")"
+printf '%s' "$got" | grep -qE "$CPU_ERROR" || { echo "FAIL: a SQL statement without an end returned '$got'" >&2; exit 1; }
+sql_ms="$(printf '%s' "$got" | awk '{print $2}')"
+[ "$sql_ms" -ge 450 ] && [ "$sql_ms" -le 3000 ] || { echo "FAIL: the SQL statement ended after $sql_ms ms" >&2; exit 1; }
+[ "$health_ms" -le 3000 ] || { echo "FAIL: /health waited $health_ms ms during the SQL statement" >&2; exit 1; }
+echo "ok: SQL statement -> $got; /health answered after $health_ms ms during it"
+expect_match "http://127.0.0.1:$L/" '^200 [0-9]+ kept$'
+expect_ms_between "http://127.0.0.1:$L/?mode=txcount" 450 3000 "$CPU_ERROR"
+expect_match "http://127.0.0.1:$L/" '^200 [0-9]+ kept$'
+expect_match "http://127.0.0.1:$L/?mode=put" '^200 [0-9]+ kept,kept$'
+# The config Worker's own Durable Object runs a statement longer than the limit; it is not limited.
+expect_ms_between "http://127.0.0.1:$L/?own=1&n=20000000" 500 25000 '^200 [0-9]+ own ok$'
 
 echo "smoke test passed"

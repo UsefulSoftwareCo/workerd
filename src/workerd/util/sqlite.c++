@@ -611,6 +611,21 @@ static constexpr PragmaInfo ALLOWED_PRAGMAS[] = {{"data_version"_kj, PragmaSigna
 
 SqliteObserver SqliteObserver::DEFAULT = SqliteObserver{};
 
+namespace {
+kj::Maybe<SqliteDatabase::InterruptCheck> interruptCheck;
+
+int interruptProgressHandler(void*) {
+  KJ_IF_SOME(check, interruptCheck) {
+    return check.requested() ? 1 : 0;
+  }
+  return 0;
+}
+}  // namespace
+
+void SqliteDatabase::setInterruptCheck(InterruptCheck check) {
+  interruptCheck = check;
+}
+
 SqliteDatabase::SqliteDatabase(const Vfs& vfs,
     kj::Path path,
     kj::Maybe<kj::WriteMode> maybeMode,
@@ -675,6 +690,11 @@ void SqliteDatabase::init(kj::Maybe<kj::WriteMode> maybeMode) {
   }
 
   setupSecurity(db);
+
+  // Executor fork: see setInterruptCheck().
+  if (interruptCheck != kj::none) {
+    sqlite3_progress_handler(db, 4096, &interruptProgressHandler, nullptr);
+  }
 
   maybeDb = *db;
 }
@@ -984,7 +1004,19 @@ SqliteDatabase::StatementAndEffect SqliteDatabase::prepareSql(StaticRegulator re
             } else if (err == SQLITE_ROW) {
               // Intermediate statement returned results. We will discard.
             } else {
-              SQLITE_CALL_FAILED("sqlite3_step()", err);
+              if (err == SQLITE_INTERRUPT) {
+        KJ_IF_SOME(check, interruptCheck) {
+          if (check.requested()) {
+            // Executor fork: the statement was ended by setInterruptCheck()'s check. Let the
+            // database see the interrupt (a transaction it ended is rolled back, and its owner
+            // told so) with the check's error, then end the caller.
+            handleCriticalError(err, dbErrorMessage(err, db), check.error());
+            check.end();
+            KJ_UNREACHABLE;
+          }
+        }
+      }
+      SQLITE_CALL_FAILED("sqlite3_step()", err);
             }
           }
 
@@ -1824,6 +1856,18 @@ void SqliteDatabase::Query::nextRow(bool first) {
     if (err == SQLITE_DONE) {
       done = true;
     } else if (err != SQLITE_ROW) {
+      if (err == SQLITE_INTERRUPT) {
+        KJ_IF_SOME(check, interruptCheck) {
+          if (check.requested()) {
+            // Executor fork: the statement was ended by setInterruptCheck()'s check. Let the
+            // database see the interrupt (a transaction it ended is rolled back, and its owner
+            // told so) with the check's error, then end the caller.
+            handleCriticalError(err, dbErrorMessage(err, db), check.error());
+            check.end();
+            KJ_UNREACHABLE;
+          }
+        }
+      }
       SQLITE_CALL_FAILED("sqlite3_step()", err);
     }
   }

@@ -23,6 +23,7 @@
 #include <workerd/server/fallback-service.h>
 #include <workerd/server/workerd-api.h>
 #include <workerd/util/autogate.h>
+#include <workerd/util/sqlite.h>
 #include <workerd/util/strings.h>
 #include <workerd/util/use-perfetto-categories.h>
 
@@ -110,6 +111,13 @@ WorkerFactory::Impl::Impl(WorkerFactory& factory,
     auto sliceCpuMs = root.getDynamicWorkerLimits().getSliceCpuMs();
     if (sliceCpuMs > 0) {
       sliceWatchdog = kj::arc<const SliceWatchdog>(sliceCpuMs * kj::MILLISECONDS);
+      // A SQLite statement of a limited Worker ends with the limit too. Statements of Workers
+      // defined in the config run under no slice, so the check never ends them.
+      SqliteDatabase::setInterruptCheck({
+        .requested = &currentSliceExceeded,
+        .error = &sliceLimitException,
+        .end = &endCurrentSlice,
+      });
     }
   }
 }

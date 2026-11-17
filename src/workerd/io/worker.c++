@@ -2312,14 +2312,11 @@ kj::Maybe<jsg::JsObject> tryResolveMainModule(jsg::Lock& js,
     limitScope = script.getIsolate().getLimitEnforcer().enterStartupJs(js, limitErrorOrTime);
   }
 
-  KJ_DEFER({
-    if (limitErrorOrTime.is<kj::Exception>()) {
-      // If we hit the limit in PerformMicrotaskCheckpoint() we may not have actually
-      // thrown an exception.
-      throw jsg::JsExceptionThrown();
-    }
-  });
-
+  // Executor fork: the module is resolved in a function of its own so that the limit scope ends,
+  // and records whether a limit was hit, before the outcome is checked below. Checking it while the
+  // scope was still open missed a limit hit in a microtask the module's evaluation queued, which
+  // need not throw, and took the partly started Worker as started.
+  auto result = [&]() -> kj::Maybe<jsg::JsObject> {
   // Before resolving the main module, if both nodejs_compat_v2 and the new
   // module registry are enabled, let's pre-resolve the process and buffer modules.
   // Why? Great question! Resolving these modules synchronously causes the microtask
@@ -2352,6 +2349,14 @@ kj::Maybe<jsg::JsObject> tryResolveMainModule(jsg::Lock& js,
   }
 
   return js.resolveModule(mainModule.toString(false), jsg::RequireEsm::YES);
+  }();
+  limitScope = nullptr;
+  if (limitErrorOrTime.is<kj::Exception>()) {
+    // If we hit the limit in PerformMicrotaskCheckpoint() we may not have actually
+    // thrown an exception.
+    throw jsg::JsExceptionThrown();
+  }
+  return result;
 }
 }  // anonymous namespace
 

@@ -62,6 +62,15 @@ class SliceWatchdog final: public kj::AtomicRefcounted {
 // EXCEEDED_CPU.
 kj::Exception sliceLimitException();
 
+// Whether a slice armed on the calling thread, or one it is nested in, has used the limit. Native
+// code that V8's termination cannot reach (SQLite statements) checks this to end itself.
+bool currentSliceExceeded();
+
+// Ends the JavaScript that called native code which stopped itself because currentSliceExceeded():
+// raises V8's termination in the calling isolate at once, so the caller ends exactly as a slice
+// whose own JavaScript used the limit.
+[[noreturn]] void endCurrentSlice();
+
 // The per-request LimitEnforcer of a Worker loader's Worker: `inner`, with every entry into
 // JavaScript limited to the watchdog's limit. After a breach the request fails with
 // sliceLimitException(), its IoContext is aborted, and the Worker's isolate is aborted, so that a
@@ -83,10 +92,19 @@ class SliceLimitedIsolateLimitEnforcer final: public IsolateLimitEnforcer {
     return startupExceeded;
   }
 
-  // True, once, after a dynamic import exceeded the limit. A dynamic import runs under its own lock
-  // outside the request's slices, so the request's enforcer asks after each of its slices.
-  bool takeDynamicImportBreach() const {
-    return std::exchange(dynamicImportExceeded, false);
+  // A slice of this isolate's JavaScript that ran outside any request: memory maintenance running
+  // the isolate's pending tasks (FinalizationRegistry callbacks and the microtasks they queue).
+  // When it ends with the limit, the isolate has a pending breach, and maintenance leaves it alone.
+  kj::Own<void> enterMaintenanceJs(jsg::Lock& lock) const;
+
+  // True after a slice that ran outside a request's own slices used the limit: a dynamic import
+  // (under its own lock) or maintenance. The next slice of a request on this isolate takes it, fails
+  // with the limit before any JavaScript runs, and unloads the Worker.
+  bool hasPendingBreach() const {
+    return pendingBreach;
+  }
+  bool takePendingBreach() const {
+    return std::exchange(pendingBreach, false);
   }
 
   v8::Isolate::CreateParams getCreateParams() override {
@@ -144,7 +162,7 @@ class SliceLimitedIsolateLimitEnforcer final: public IsolateLimitEnforcer {
   kj::Arc<const SliceWatchdog> watchdog;
   kj::Own<IsolateLimitEnforcer> inner;
   mutable bool startupExceeded = false;
-  mutable bool dynamicImportExceeded = false;
+  mutable bool pendingBreach = false;
 
   kj::Own<void> enterLimited(jsg::Lock& lock,
       kj::OneOf<kj::Exception, kj::Duration>& limitErrorOrTime,

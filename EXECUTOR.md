@@ -45,8 +45,11 @@ in `src/workerd/server/factory/`), the patches are split along that boundary:
 - A slice is one entry into JavaScript for a request or event (`IoContext::runImpl()`, with the
   microtasks it runs), one top-level module evaluation (`enterStartupJs()`) or one dynamic import
   (`enterDynamicImportJs()`). Awaiting I/O, timers or RPC is outside every slice. Python startup,
-  inspector commands and the memory maintenance loop's task pumping are not limited. The CPU
-  budget applies only at these execution boundaries; it is not a process-wide responsiveness
+  inspector commands are not limited. Memory maintenance runs a loader Worker's isolate (its
+  collection, and every task and microtask it pumps) under a slice of its own, and a SQL
+  statement of a limited Worker ends with the limit (SQLite's progress handler). A breach outside
+  a request fails the Worker's next request with the limit and unloads it. The CPU budget
+  applies only at these execution boundaries; it is not a process-wide responsiveness
   guarantee.
 - The limit is on the CPU time of the thread that runs the slice. One watchdog thread checks the
   slices in progress every tenth of the limit (1 ms to 100 ms) and terminates a slice's JavaScript
@@ -58,6 +61,9 @@ in `src/workerd/server/factory/`), the patches are split along that boundary:
   the same way.
 - A single native call that does not check for termination (a large sort, `JSON.parse` or
   `structuredClone`) ends the slice only when it returns.
+- Known limits, with or without the limit set: V8 running out of heap ends the process, and the
+  resident set grows by about 8 KiB each time an ordinary Worker isolate is replaced. A retired
+  Durable Object facet can hold much more, about 1.7 MiB, until a full collection runs.
 
 ### Notes on the memory patches
 
@@ -70,7 +76,8 @@ in `src/workerd/server/factory/`), the patches are split along that boundary:
   callbacks queue) outside of any request, like workerd does at the end of a request. Without a
   request there is no request LimitEnforcer, so it stops on the isolate's heap limit, on
   termination, or after 10000 tasks instead; the count bounds how many tasks run, not how long
-  one runs. It can run while requests of that isolate are suspended.
+  one runs. With `Config.dynamicWorkerLimits` set, a Worker loader's Worker runs them under the
+  CPU slice limit. It can run while requests of that isolate are suspended.
 - A named Worker loader entry is unloaded only when no stub, request, entrypoint or actor class
   channel references it, and its Worker has no `ctx.waitUntil()` work or actor running.
 
