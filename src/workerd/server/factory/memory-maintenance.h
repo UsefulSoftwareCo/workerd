@@ -35,8 +35,10 @@ class MemoryMaintenance final: private kj::TaskSet::ErrorHandler {
 
   void registerIsolate(kj::StringPtr name, const Worker::Isolate& isolate);
 
- private:
+  // Public so that helpers in memory-maintenance.c++ can name it; defined there.
   struct IsolateEntry;
+
+ private:
 
   kj::Timer& timer;
   kj::Duration interval;
@@ -45,6 +47,15 @@ class MemoryMaintenance final: private kj::TaskSet::ErrorHandler {
   kj::Duration idleTaskPump;
   uint64_t pressureThresholdBytes;
   kj::Duration pressureCooldown;
+  kj::Duration pressureGcBudget;
+
+  // Wait after the current pass: `pressureCooldown`, doubled after every pass that ends with
+  // usage still above the threshold (up to 16 times), and reset once usage is below it.
+  kj::Duration currentPressureCooldown;
+
+  // Isolates the current memory pressure pass has yet to visit. Empty between passes.
+  kj::Vector<kj::Rc<IsolateEntry>> pressureQueue;
+  uint pressurePassCollected = 0;
   bool releaseMemoryAfterGc;
   kj::TimePoint nextPressureCollection;
 
@@ -61,7 +72,8 @@ class MemoryMaintenance final: private kj::TaskSet::ErrorHandler {
   kj::Promise<void> sweep();
   kj::Promise<void> collectIdle(kj::Rc<IsolateEntry> entry);
   kj::Promise<void> pumpWhileIdle(kj::Rc<IsolateEntry> entry, kj::TimePoint until);
-  kj::Promise<void> collectAll(uint64_t usage);
+  kj::Promise<void> relievePressure(kj::TimePoint now);
+  kj::Promise<bool> collectUnderPressure(kj::Rc<IsolateEntry> entry);
 };
 
 }  // namespace workerd::server
